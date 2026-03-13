@@ -82,6 +82,7 @@ func TestHandleSuggestTopicKeyRequiresInput(t *testing.T) {
 	}
 }
 
+
 func TestHandleSaveSuggestsTopicKeyWhenMissing(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s)
