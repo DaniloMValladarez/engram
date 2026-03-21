@@ -1,9 +1,10 @@
 // Package setup handles agent plugin installation.
 //
 //   - OpenCode: copies embedded plugin file to ~/.config/opencode/plugins/
-//     and injects MCP registration in opencode.json using the resolved binary
-//     path (absolute on Windows, bare "engram" on Unix) so the MCP subprocess
-//     never requires PATH resolution in headless/systemd environments.
+//     (patching ENGRAM_BIN to bake in the absolute binary path as a final
+//     fallback) and injects MCP registration in opencode.json using the
+//     resolved absolute binary path so child processes never require PATH
+//     resolution in headless/systemd environments.
 //   - Claude Code: runs `claude plugin marketplace add` + `claude plugin install`,
 //     then writes a durable MCP config to ~/.claude/mcp/engram.json using the
 //     absolute binary path so the subprocess never needs PATH resolution.
@@ -89,11 +90,12 @@ var claudeCodeMCPTools = []string{
 // Command is always the bare "engram" name in this constant because
 // upsertCodexEngramBlock generates the actual content via codexEngramBlockStr()
 // which uses resolveEngramCommand() at runtime. This constant is kept for tests
-// that verify idempotency against the already-written string.
+// that verify idempotency against the already-written string when os.Executable
+// returns "engram" (fallback path).
 const codexEngramBlock = "[mcp_servers.engram]\ncommand = \"engram\"\nargs = [\"mcp\", \"--tools=agent\"]"
 
 // codexEngramBlockStr returns the Codex TOML block for the engram MCP server,
-// using the resolved command (absolute path on Windows, bare name on Unix).
+// using the resolved absolute binary path from os.Executable().
 func codexEngramBlockStr() string {
 	cmd := resolveEngramCommand()
 	return "[mcp_servers.engram]\ncommand = " + fmt.Sprintf("%q", cmd) + "\nargs = [\"mcp\", \"--tools=agent\"]"
@@ -251,6 +253,42 @@ func Install(agentName string) (*Result, error) {
 
 // ─── OpenCode ────────────────────────────────────────────────────────────────
 
+// patchEngramBINLine rewrites the ENGRAM_BIN constant declaration in the
+// plugin source so the installed copy contains an absolute fallback path.
+//
+// Original line in source:
+//
+//	const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram"
+//
+// Patched line in installed copy:
+//
+//	const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "/abs/path/engram"
+//
+// Priority (left to right, first truthy wins):
+//  1. ENGRAM_BIN env var — explicit user override, always respected.
+//  2. Bun.which("engram") — runtime PATH lookup; works in interactive shells.
+//  3. Absolute baked-in path — works in headless/systemd where PATH is stripped.
+//
+// If absBin is already bare "engram" (os.Executable fallback) we don't add it
+// as the third fallback because it would be redundant with Bun.which("engram").
+func patchEngramBINLine(src []byte, absBin string) []byte {
+	const marker = `const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram"`
+
+	var replacement string
+	if absBin == "engram" {
+		// os.Executable failed — add Bun.which but no baked-in absolute path
+		replacement = `const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "engram"`
+	} else {
+		// Normal case: bake in the absolute path as final fallback
+		replacement = fmt.Sprintf(
+			`const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? %q`,
+			absBin,
+		)
+	}
+
+	return []byte(strings.Replace(string(src), marker, replacement, 1))
+}
+
 func installOpenCode() (*Result, error) {
 	dir := openCodePluginDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -261,6 +299,14 @@ func installOpenCode() (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read embedded engram.ts: %w", err)
 	}
+
+	// Patch ENGRAM_BIN in the installed copy so the plugin can find the binary
+	// in headless/systemd environments where PATH may not include user tool dirs.
+	// The installed file gets a baked-in absolute path while still honoring
+	// process.env.ENGRAM_BIN (explicit user override) and Bun.which("engram")
+	// (runtime PATH lookup when PATH is available). The source plugin file is
+	// not modified — it keeps the simple env-var form for development flexibility.
+	data = patchEngramBINLine(data, resolveEngramCommand())
 
 	dest := filepath.Join(dir, "engram.ts")
 	if err := openCodeWriteFileFn(dest, data, 0644); err != nil {
@@ -704,14 +750,12 @@ func injectGeminiMCP(configPath string) error {
 	return nil
 }
 
-// resolveEngramCommand returns the command string to put in agent MCP configs.
-// On Windows, MCP subprocesses may not inherit PATH, so we use the absolute
-// binary path from os.Executable(). On Unix, bare "engram" is sufficient
-// because PATH is reliably inherited.
+// resolveEngramCommand returns the absolute path to the engram binary.
+// It uses os.Executable() so that headless/systemd environments (where PATH
+// is not reliably inherited by child processes) still find the binary.
+// EvalSymlinks makes the path stable across package-manager upgrades.
+// Falls back to bare "engram" only if os.Executable() itself fails.
 func resolveEngramCommand() string {
-	if runtimeGOOS != "windows" {
-		return "engram"
-	}
 	exe, err := osExecutable()
 	if err != nil {
 		return "engram" // fallback to PATH-based name
