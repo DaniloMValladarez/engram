@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -96,7 +97,11 @@ func resetSyncTestHooks(t *testing.T) {
 	origOSHostname := osHostname
 	origStoreGetSynced := storeGetSynced
 	origStoreExportData := storeExportData
+	origStoreExportDataForProject := storeExportDataForProject
+	origStoreListMutationsAfterSeq := storeListMutationsAfterSeq
+	origStoreAckMutationSeq := storeAckMutationSeq
 	origStoreImportData := storeImportData
+	origStoreApplyPulledChunk := storeApplyPulledChunk
 	origStoreRecordSynced := storeRecordSynced
 
 	t.Cleanup(func() {
@@ -107,7 +112,11 @@ func resetSyncTestHooks(t *testing.T) {
 		osHostname = origOSHostname
 		storeGetSynced = origStoreGetSynced
 		storeExportData = origStoreExportData
+		storeExportDataForProject = origStoreExportDataForProject
+		storeListMutationsAfterSeq = origStoreListMutationsAfterSeq
+		storeAckMutationSeq = origStoreAckMutationSeq
 		storeImportData = origStoreImportData
+		storeApplyPulledChunk = origStoreApplyPulledChunk
 		storeRecordSynced = origStoreRecordSynced
 	})
 }
@@ -115,6 +124,50 @@ func resetSyncTestHooks(t *testing.T) {
 type fakeGzipWriter struct {
 	writeErr error
 	closeErr error
+}
+
+type fakeCloudTransport struct {
+	manifest          *Manifest
+	chunks            map[string][]byte
+	readChunkErr      error
+	readManifestCalls int
+	writeChunkCalls   int
+	readChunkCalls    int
+}
+
+func newFakeCloudTransport() *fakeCloudTransport {
+	return &fakeCloudTransport{
+		manifest: &Manifest{Version: 1},
+		chunks:   map[string][]byte{},
+	}
+}
+
+func (f *fakeCloudTransport) ReadManifest() (*Manifest, error) {
+	f.readManifestCalls++
+	return f.manifest, nil
+}
+
+func (f *fakeCloudTransport) WriteManifest(m *Manifest) error {
+	f.manifest = m
+	return nil
+}
+
+func (f *fakeCloudTransport) WriteChunk(chunkID string, data []byte, _ ChunkEntry) error {
+	f.writeChunkCalls++
+	f.chunks[chunkID] = data
+	return nil
+}
+
+func (f *fakeCloudTransport) ReadChunk(chunkID string) ([]byte, error) {
+	f.readChunkCalls++
+	if f.readChunkErr != nil {
+		return nil, f.readChunkErr
+	}
+	data, ok := f.chunks[chunkID]
+	if !ok {
+		return nil, ErrChunkNotFound
+	}
+	return data, nil
 }
 
 func (f *fakeGzipWriter) Write(_ []byte) (int, error) {
@@ -357,7 +410,7 @@ func TestExportErrors(t *testing.T) {
 		seedStoreForSync(t, s)
 		sy := New(s, t.TempDir())
 
-		storeRecordSynced = func(_ *store.Store, _ string) error {
+		storeRecordSynced = func(_ *store.Store, _, _ string) error {
 			return errors.New("forced record failure")
 		}
 
@@ -365,6 +418,74 @@ func TestExportErrors(t *testing.T) {
 			t.Fatalf("expected record synced chunk error, got %v", err)
 		}
 	})
+}
+
+func TestExportUsesProjectScopedStoreExportWhenProjectProvided(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	sy := New(s, t.TempDir())
+
+	projectExportCalled := 0
+	storeExportData = func(_ *store.Store) (*store.ExportData, error) {
+		return nil, errors.New("global export should not be called for project-scoped sync")
+	}
+	storeExportDataForProject = func(_ *store.Store, project string) (*store.ExportData, error) {
+		projectExportCalled++
+		if project != "proj-a" {
+			t.Fatalf("expected project proj-a, got %q", project)
+		}
+		return &store.ExportData{Version: "0.1.0", ExportedAt: time.Now().UTC().Format(time.RFC3339)}, nil
+	}
+
+	res, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !res.IsEmpty {
+		t.Fatalf("expected empty export result for empty project dataset, got %+v", res)
+	}
+	if projectExportCalled != 1 {
+		t.Fatalf("expected project-scoped export hook to be called once, got %d", projectExportCalled)
+	}
+}
+
+func TestExportDoesNotReconcileLocallyMissingChunkByOwnershipHeuristic(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	transport := newFakeCloudTransport()
+	sy := NewWithTransport(s, transport)
+
+	var recordCalls int
+	storeRecordSynced = func(_ *store.Store, _, _ string) error {
+		recordCalls++
+		if recordCalls == 1 {
+			return errors.New("forced record failure")
+		}
+		return nil
+	}
+
+	first, err := sy.Export("alice", "")
+	if err == nil || !strings.Contains(err.Error(), "record synced chunk") {
+		t.Fatalf("expected record synced chunk error, got result=%+v err=%v", first, err)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("expected first export to write one chunk, got %d", transport.writeChunkCalls)
+	}
+
+	second, err := sy.Export("alice", "")
+	if err != nil {
+		t.Fatalf("second export should reconcile local sync tracking: %v", err)
+	}
+	if second == nil || !second.IsEmpty {
+		t.Fatalf("expected second export to be empty after reconciliation, got %+v", second)
+	}
+	if recordCalls != 1 {
+		t.Fatalf("expected no ownership-based reconciliation retries, got %d calls", recordCalls)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("expected no duplicate remote chunk writes, got %d", transport.writeChunkCalls)
+	}
 }
 
 func TestImportBranches(t *testing.T) {
@@ -514,7 +635,7 @@ func TestImportBranches(t *testing.T) {
 			t.Fatalf("write gzip chunk: %v", err)
 		}
 
-		storeRecordSynced = func(_ *store.Store, _ string) error {
+		storeRecordSynced = func(_ *store.Store, _, _ string) error {
 			return errors.New("forced import record fail")
 		}
 
@@ -632,6 +753,874 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestCloudSyncPreflightBlocksUnenrolledBeforeTransport(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if _, err := sy.Export("alice", "proj-a"); err == nil || !strings.Contains(err.Error(), "blocked_unenrolled") {
+		t.Fatalf("expected blocked_unenrolled error, got %v", err)
+	}
+
+	if transport.readManifestCalls != 0 || transport.writeChunkCalls != 0 {
+		t.Fatalf("expected no transport calls before preflight passes, got readManifest=%d writeChunk=%d", transport.readManifestCalls, transport.writeChunkCalls)
+	}
+
+	state, err := s.GetSyncState("cloud:proj-a")
+	if err != nil {
+		t.Fatalf("get sync state: %v", err)
+	}
+	if state.ReasonCode == nil || *state.ReasonCode != "blocked_unenrolled" {
+		t.Fatalf("expected reason_code blocked_unenrolled, got %v", state.ReasonCode)
+	}
+}
+
+func TestCloudSyncPreflightRequiresExplicitProjectScope(t *testing.T) {
+	s := newTestStore(t)
+	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "")
+
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "explicit --project") {
+		t.Fatalf("expected explicit project scope error, got %v", err)
+	}
+}
+
+func TestCloudSyncEnrolledExportImportAndIdempotentPull(t *testing.T) {
+	srcStore := newTestStore(t)
+	seedStoreForSync(t, srcStore)
+	if err := srcStore.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll src project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	exporter := NewCloudWithTransport(srcStore, transport, "proj-a")
+
+	exportResult, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if exportResult.IsEmpty {
+		t.Fatal("expected non-empty cloud export for enrolled project")
+	}
+
+	dstStore := newTestStore(t)
+	if err := dstStore.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll dst project: %v", err)
+	}
+	importer := NewCloudWithTransport(dstStore, transport, "proj-a")
+
+	importResult, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+	if importResult.ChunksImported != 1 {
+		t.Fatalf("expected one imported chunk, got %+v", importResult)
+	}
+
+	importAgain, err := importer.Import()
+	if err != nil {
+		t.Fatalf("second cloud import: %v", err)
+	}
+	if importAgain.ChunksImported != 0 || importAgain.ChunksSkipped != 1 {
+		t.Fatalf("expected idempotent second import, got %+v", importAgain)
+	}
+}
+
+func TestCloudExportUsesMutationJournalForUpdatesAndDeletes(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	updatedTitle := "updated"
+	if _, err := s.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("delete observation: %v", err)
+	}
+
+	result, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export with mutation journal: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected mutation-backed export to include updates/deletes")
+	}
+
+	payload, ok := transport.chunks[result.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", result.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Observations) != 1 {
+		t.Fatalf("expected one mutated observation in chunk, got %d", len(chunk.Observations))
+	}
+	if chunk.Observations[0].DeletedAt == nil {
+		t.Fatalf("expected deleted_at tombstone in exported observation, got %+v", chunk.Observations[0])
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected mutation journal to be acked after cloud export, got %+v", pending)
+	}
+}
+
+func TestCloudExportWritesMutationOnlyChunkForHardDeletes(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	if err := s.DeleteObservation(obsID, true); err != nil {
+		t.Fatalf("hard delete observation: %v", err)
+	}
+
+	second, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected mutation-only cloud export to write a chunk")
+	}
+	if second.MutationsExported == 0 {
+		t.Fatalf("expected mutation-backed export counter to be non-zero, got %+v", second)
+	}
+	if second.SessionsExported != 0 || second.ObservationsExported != 0 || second.PromptsExported != 0 {
+		t.Fatalf("expected mutation-only export to keep entity snapshot counters at zero, got %+v", second)
+	}
+
+	payload, ok := transport.chunks[second.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", second.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Observations) != 0 {
+		t.Fatalf("expected mutation-only chunk without observations, got %d", len(chunk.Observations))
+	}
+	if len(chunk.Mutations) == 0 {
+		t.Fatalf("expected mutation-only chunk to include mutation journal payload")
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected pending mutations to be acked only after chunk write, got %+v", pending)
+	}
+}
+
+func TestCloudExportKnownChunkReconcileFailureDoesNotAckMutations(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	updatedTitle := "updated"
+	if _, err := s.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+
+	projectData, err := s.ExportProject("proj-a")
+	if err != nil {
+		t.Fatalf("export project data: %v", err)
+	}
+	chunk, seqs, err := sy.filterByPendingMutations(projectData, "proj-a")
+	if err != nil {
+		t.Fatalf("filter by pending mutations: %v", err)
+	}
+	if len(seqs) == 0 {
+		t.Fatal("expected pending mutation seqs")
+	}
+
+	chunkJSON, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal chunk: %v", err)
+	}
+	chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, "proj-a")
+	if err != nil {
+		t.Fatalf("canonicalize chunk: %v", err)
+	}
+	knownChunkID := chunkcodec.ChunkID(chunkJSON)
+	transport.manifest.Chunks = append(transport.manifest.Chunks, ChunkEntry{ID: knownChunkID, CreatedBy: "remote", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+
+	ackCalls := 0
+	storeAckMutationSeq = func(storeRef *store.Store, targetKey string, seqs []int64) error {
+		ackCalls++
+		return storeRef.AckSyncMutationSeqs(targetKey, seqs)
+	}
+	storeRecordSynced = func(_ *store.Store, targetKey, chunkID string) error {
+		if chunkID == knownChunkID {
+			return errors.New("forced record failure")
+		}
+		return s.RecordSyncedChunkForTarget(targetKey, chunkID)
+	}
+
+	_, err = sy.Export("alice", "proj-a")
+	if err == nil || !strings.Contains(err.Error(), "reconcile synced chunk") {
+		t.Fatalf("expected reconcile synced chunk error, got %v", err)
+	}
+	if ackCalls != 0 {
+		t.Fatalf("expected mutation ack to be skipped when reconcile fails, got %d calls", ackCalls)
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("expected pending mutation journal to remain after reconcile failure")
+	}
+}
+
+func TestCloudExportHardDeleteWithEmptyEntityProjectUsesSessionProjectScope(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	if err := s.DeleteObservation(obsID, true); err != nil {
+		t.Fatalf("hard delete observation: %v", err)
+	}
+
+	second, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected hard delete mutation export even when entity project is empty")
+	}
+
+	payload, ok := transport.chunks[second.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", second.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Mutations) == 0 {
+		t.Fatalf("expected mutation-only chunk to include delete mutation")
+	}
+}
+
+func TestCloudImportAppliesMutationReconciliationForUpdatesAndDeletes(t *testing.T) {
+	src := newTestStore(t)
+	transport := newFakeCloudTransport()
+	exporter := NewCloudWithTransport(src, transport, "proj-a")
+
+	if err := src.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll source project: %v", err)
+	}
+	if err := src.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := src.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "v1",
+		Content:   "original",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	promptID, err := src.AddPrompt(store.AddPromptParams{SessionID: "sess-a", Content: "to-delete", Project: "proj-a"})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	first, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first cloud export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first cloud export to write initial snapshot")
+	}
+
+	updatedTitle := "v2"
+	if _, err := src.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	if err := src.DeletePrompt(promptID); err != nil {
+		t.Fatalf("delete prompt: %v", err)
+	}
+
+	second, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second cloud export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected second cloud export to include follow-up mutations")
+	}
+
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+
+	if _, err := importer.Import(); err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+
+	// Resolve by content/title since sync id is generated internally.
+	found, err := dst.Search("v2", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search updated observation: %v", err)
+	}
+	if len(found) == 0 || found[0].Title != "v2" {
+		t.Fatalf("expected updated observation title after pull reconciliation, got %+v", found)
+	}
+
+	prompts, err := dst.RecentPrompts("proj-a", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	for _, p := range prompts {
+		if p.Content == "to-delete" {
+			t.Fatalf("expected deleted prompt to remain deleted after cloud pull, prompts=%+v", prompts)
+		}
+	}
+}
+
+func TestCloudImportChunkApplyIsAtomicOnFailure(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-atomic"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: time.Now().UTC().Format(time.RFC3339)}}}
+
+	badChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "remote-sess",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"remote-sess","project":"proj-a","directory":"/remote"}`,
+		},
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-bad",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-bad","session_id":"missing-session","type":"note","title":"bad","content":"fails fk","project":"proj-a","scope":"project"}`,
+		},
+	}}
+	badPayload, err := json.Marshal(badChunk)
+	if err != nil {
+		t.Fatalf("marshal bad chunk: %v", err)
+	}
+	transport.chunks[chunkID] = badPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	if _, err := importer.Import(); err == nil {
+		t.Fatal("expected cloud import failure for invalid mutation chunk")
+	}
+
+	if _, err := dst.GetSession("remote-sess"); err == nil {
+		t.Fatal("expected remote session mutation to be rolled back after failed chunk import")
+	}
+	synced, err := dst.GetSyncedChunks()
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if synced[chunkID] {
+		t.Fatalf("failed chunk %q must not be marked synced", chunkID)
+	}
+}
+
+func TestCloudImportReordersChunksToEstablishSessionsBeforeDependents(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	obsFirstID := "chunk-observation-first"
+	sessionSecondID := "chunk-session-second"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{
+		{ID: obsFirstID, CreatedAt: "2026-04-10T10:00:00Z"},
+		{ID: sessionSecondID, CreatedAt: "2026-04-10T11:00:00Z"},
+	}}
+
+	obsChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-needs-session",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-needs-session","session_id":"sess-bootstrap","type":"note","title":"boot","content":"depends on session","project":"proj-a","scope":"project"}`,
+		},
+	}}
+	obsPayload, err := json.Marshal(obsChunk)
+	if err != nil {
+		t.Fatalf("marshal observation-first chunk: %v", err)
+	}
+	transport.chunks[obsFirstID] = obsPayload
+
+	sessionChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-bootstrap",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-bootstrap","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	sessionPayload, err := json.Marshal(sessionChunk)
+	if err != nil {
+		t.Fatalf("marshal session chunk: %v", err)
+	}
+	transport.chunks[sessionSecondID] = sessionPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	result, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import should succeed after dependency-safe ordering: %v", err)
+	}
+	if result.ChunksImported != 2 {
+		t.Fatalf("expected both chunks imported, got %+v", result)
+	}
+
+	if _, err := dst.GetSession("sess-bootstrap"); err != nil {
+		t.Fatalf("expected session imported before dependent observation apply: %v", err)
+	}
+	results, err := dst.Search("depends on session", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected dependent observation to import successfully")
+	}
+}
+
+func TestCloudImportReordersMutationsWithinChunkToAvoidFKFailures(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-mixed-order"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-04-10T10:00:00Z"}}}
+
+	mixedChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-mixed","session_id":"sess-mixed","type":"note","title":"mixed","content":"chunk needs reorder","project":"proj-a","scope":"project"}`,
+		},
+		{
+			Entity:    store.SyncEntityPrompt,
+			EntityKey: "prompt-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"prompt-mixed","session_id":"sess-mixed","content":"prompt depends on session","project":"proj-a"}`,
+		},
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-mixed","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	chunkPayload, err := json.Marshal(mixedChunk)
+	if err != nil {
+		t.Fatalf("marshal mixed chunk: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	result, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import should reorder mixed chunk mutations safely: %v", err)
+	}
+	if result.ChunksImported != 1 {
+		t.Fatalf("expected one imported chunk, got %+v", result)
+	}
+
+	if _, err := dst.GetSession("sess-mixed"); err != nil {
+		t.Fatalf("expected session to be imported: %v", err)
+	}
+	results, err := dst.Search("chunk needs reorder", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected dependent observation to import successfully")
+	}
+}
+
+func TestCloudImportMixedChunkAppliesDirectArrayDependenciesBeforeMutations(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-mixed-direct-and-mutations"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-04-10T10:00:00Z"}}}
+
+	mixedChunk := ChunkData{
+		Sessions: []store.Session{{
+			ID:        "sess-direct",
+			Project:   "proj-a",
+			Directory: "/tmp/proj-a",
+			StartedAt: "2026-04-10 09:59:00",
+		}},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-direct-dep",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-direct-dep","session_id":"sess-direct","type":"note","title":"mixed","content":"depends on direct session","project":"proj-a","scope":"project"}`,
+		}},
+	}
+	chunkPayload, err := json.Marshal(mixedChunk)
+	if err != nil {
+		t.Fatalf("marshal mixed chunk: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	if _, err := importer.Import(); err != nil {
+		t.Fatalf("cloud import should apply direct-array dependencies before mutation replay: %v", err)
+	}
+
+	if _, err := dst.GetSession("sess-direct"); err != nil {
+		t.Fatalf("expected direct-array session to be imported: %v", err)
+	}
+	results, err := dst.Search("depends on direct session", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected observation mutation that depends on direct-array session to import successfully")
+	}
+}
+
+func TestBuildImportMutationsSkipsClosureOnlyDirectSessionsWhenChunkHasExplicitMutations(t *testing.T) {
+	chunk := ChunkData{
+		Sessions: []store.Session{
+			{ID: "sess-needed", Project: "proj-a", Directory: "/tmp/proj-a"},
+			{ID: "sess-closure-only", Project: "proj-b", Directory: "/tmp/proj-b"},
+		},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-needs-session",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-needs-session","session_id":"sess-needed","type":"note","title":"needed","content":"depends on direct session","project":"proj-a","scope":"project"}`,
+		}},
+	}
+
+	mutations := buildImportMutations(chunk)
+
+	seenNeededSession := false
+	seenClosureOnlySession := false
+	for _, mutation := range mutations {
+		if mutation.Entity != store.SyncEntitySession || mutation.Op != store.SyncOpUpsert {
+			continue
+		}
+		switch mutation.EntityKey {
+		case "sess-needed":
+			seenNeededSession = true
+		case "sess-closure-only":
+			seenClosureOnlySession = true
+		}
+	}
+
+	if !seenNeededSession {
+		t.Fatalf("expected direct session required by explicit mutation to be synthesized")
+	}
+	if seenClosureOnlySession {
+		t.Fatalf("closure-only direct session must not be synthesized when explicit mutations exist")
+	}
+}
+
+func TestBuildImportMutationsPreservesSessionsNeededByRetainedSynthesizedEntities(t *testing.T) {
+	project := "proj-a"
+	chunk := ChunkData{
+		Sessions: []store.Session{{ID: "sess-direct", Project: project, Directory: "/tmp/proj-a"}},
+		Observations: []store.Observation{{
+			SyncID:    "obs-direct",
+			SessionID: "sess-direct",
+			Type:      "note",
+			Title:     "direct",
+			Content:   "direct-array observation",
+			Project:   &project,
+			Scope:     "project",
+		}},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-explicit",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-explicit","session_id":"sess-explicit","type":"note","title":"explicit","content":"keeps explicit path","project":"proj-a","scope":"project"}`,
+		}},
+	}
+
+	mutations := buildImportMutations(chunk)
+
+	seenDirectSession := false
+	seenDirectObservation := false
+	for _, mutation := range mutations {
+		switch {
+		case mutation.Entity == store.SyncEntitySession && mutation.Op == store.SyncOpUpsert && mutation.EntityKey == "sess-direct":
+			seenDirectSession = true
+		case mutation.Entity == store.SyncEntityObservation && mutation.Op == store.SyncOpUpsert && mutation.EntityKey == "obs-direct":
+			seenDirectObservation = true
+		}
+	}
+
+	if !seenDirectObservation {
+		t.Fatalf("expected retained synthesized observation from direct arrays")
+	}
+	if !seenDirectSession {
+		t.Fatalf("expected synthesized session required by retained synthesized observation")
+	}
+}
+
+func TestEstimateMutationImportResultDeduplicatesEffectiveMutations(t *testing.T) {
+	chunk := ChunkData{Mutations: []store.SyncMutation{
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpDelete},
+		{Entity: store.SyncEntitySession, EntityKey: "sess-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntitySession, EntityKey: "sess-a", Op: store.SyncOpUpsert},
+	}}
+
+	res := estimateMutationImportResult(chunk)
+	if res.SessionsImported != 1 {
+		t.Fatalf("expected deduped session count=1, got %d", res.SessionsImported)
+	}
+	if res.ObservationsImported != 1 {
+		t.Fatalf("expected deduped observation count=1, got %d", res.ObservationsImported)
+	}
+	if res.PromptsImported != 0 {
+		t.Fatalf("expected prompt final delete to count as 0 imports, got %d", res.PromptsImported)
+	}
+}
+
+func TestFilterByPendingMutationsPaginatesBeforeProjectFiltering(t *testing.T) {
+	resetSyncTestHooks(t)
+
+	s := newTestStore(t)
+	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "proj-a")
+
+	projA := "proj-a"
+	data := &store.ExportData{
+		Sessions: []store.Session{{ID: "sess-a", Project: "proj-a"}},
+		Observations: []store.Observation{{
+			ID:        1,
+			SyncID:    "obs-a",
+			SessionID: "sess-a",
+			Project:   &projA,
+		}},
+	}
+
+	storeListMutationsAfterSeq = func(_ *store.Store, _ string, afterSeq int64, _ int) ([]store.SyncMutation, error) {
+		switch afterSeq {
+		case 0:
+			batch := make([]store.SyncMutation, 0, 5000)
+			for seq := int64(1); seq <= 5000; seq++ {
+				batch = append(batch, store.SyncMutation{
+					Seq:       seq,
+					Entity:    store.SyncEntityObservation,
+					EntityKey: fmt.Sprintf("obs-other-%d", seq),
+					Op:        store.SyncOpUpsert,
+					Project:   "proj-b",
+				})
+			}
+			return batch, nil
+		case 5000:
+			return []store.SyncMutation{{
+				Seq:       5001,
+				Entity:    store.SyncEntityObservation,
+				EntityKey: "obs-a",
+				Op:        store.SyncOpUpsert,
+				Project:   "proj-a",
+			}}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	chunk, seqs, err := sy.filterByPendingMutations(data, "proj-a")
+	if err != nil {
+		t.Fatalf("filter by pending mutations: %v", err)
+	}
+	if len(seqs) != 1 || seqs[0] != 5001 {
+		t.Fatalf("expected project mutation from second page to be selected, got seqs=%v", seqs)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-a" {
+		t.Fatalf("expected paginated project observation to be included, got %+v", chunk.Observations)
+	}
+}
+
+func TestExportDoesNotReconcileUnsyncedChunksByCreatedByOnly(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{
+		Version: 1,
+		Chunks: []ChunkEntry{{
+			ID:        "foreign-like",
+			CreatedBy: "alice",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+
+	sy := NewWithTransport(s, transport)
+	res, err := sy.Export("alice", "")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !res.IsEmpty {
+		t.Fatalf("expected empty export result, got %+v", res)
+	}
+
+	synced, err := s.GetSyncedChunks()
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if synced["foreign-like"] {
+		t.Fatal("chunk ownership must not be inferred from CreatedBy alone")
+	}
+}
+
+func TestCloudImportTreatsMissingManifestChunkAsError(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "missing", CreatedAt: time.Now().UTC().Format(time.RFC3339)}}}
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Missing chunk referenced by manifest must fail loudly in cloud mode.
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "manifest references missing remote chunk") {
+		t.Fatalf("expected manifest missing chunk failure, got %v", err)
+	}
+
+	// now force a non-not-found read failure and ensure it propagates loudly
+	transport.readChunkErr = errors.New("transport offline")
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "read chunk") {
+		t.Fatalf("expected read chunk failure to propagate, got %v", err)
+	}
+}
+
 func TestFilterFunctionsAndTimeNormalization(t *testing.T) {
 	data := &store.ExportData{
 		Version:    "0.1.0",
@@ -659,6 +1648,11 @@ func TestFilterFunctionsAndTimeNormalization(t *testing.T) {
 	}
 	if len(projectOnly.Prompts) != 1 || projectOnly.Prompts[0].SessionID != "s1" {
 		t.Fatalf("unexpected filtered prompts: %+v", projectOnly.Prompts)
+	}
+
+	projectOnlyNormalized := filterByProject(data, " PROJ-A ")
+	if len(projectOnlyNormalized.Sessions) != 1 || projectOnlyNormalized.Sessions[0].ID != "s1" {
+		t.Fatalf("expected normalized project filter to match session s1, got %+v", projectOnlyNormalized.Sessions)
 	}
 
 	sy := New(nil, t.TempDir())
@@ -810,6 +1804,17 @@ func TestGzipHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("truncated gzip propagates decompression error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "truncated.gz")
+		if err := os.WriteFile(path, []byte{0x1f, 0x8b, 0x08, 0x00}, 0o644); err != nil {
+			t.Fatalf("write truncated gzip: %v", err)
+		}
+
+		if _, err := readGzip(path); err == nil {
+			t.Fatal("expected readGzip error for truncated gzip payload")
+		}
+	})
+
 	t.Run("gzip write and close errors", func(t *testing.T) {
 		resetSyncTestHooks(t)
 		path := filepath.Join(t.TempDir(), "chunk.gz")
@@ -878,4 +1883,19 @@ func TestGetUsernameAndManifestSummary(t *testing.T) {
 			t.Fatalf("summary contributors not sorted or counted: %q", summary)
 		}
 	})
+}
+
+func TestChunkTrackingTargetKeyScopesBySyncTarget(t *testing.T) {
+	local := &Syncer{cloudMode: false}
+	if got := local.chunkTrackingTargetKey(""); got != store.LocalChunkTargetKey {
+		t.Fatalf("expected local chunk target key %q, got %q", store.LocalChunkTargetKey, got)
+	}
+
+	cloud := &Syncer{cloudMode: true, project: "proj-a"}
+	if got := cloud.chunkTrackingTargetKey(""); got != "cloud:proj-a" {
+		t.Fatalf("expected cloud project target key, got %q", got)
+	}
+	if got := cloud.chunkTrackingTargetKey("PROJ-B"); got != "cloud:proj-b" {
+		t.Fatalf("expected explicit normalized cloud project target key, got %q", got)
+	}
 }

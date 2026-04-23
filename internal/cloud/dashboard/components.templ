@@ -1,0 +1,15 @@
+templ StatusReason(title string, code string, message string) {
+  <section class="sync-reason-card" aria-live="polite">
+    <h2>{ title }</h2>
+    <p><strong>reason_code:</strong> { code }</p>
+    <p><strong>reason_message:</strong> { message }</p>
+  </section>
+}
+
+templ SyncStatusPanel(phase string, title string, code string, message string) {
+  <main>
+    <h1>Engram Cloud Dashboard</h1>
+    <p><strong>phase:</strong> { phase }</p>
+    @StatusReason(title, code, message)
+  </main>
+}

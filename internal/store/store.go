@@ -34,6 +34,8 @@ const sqliteConstraintForeignKey = 787
 var (
 	ErrSessionNotFound        = errors.New("session not found")
 	ErrSessionHasObservations = errors.New("session still has observations")
+	ErrSessionDeleteBlocked   = errors.New("session deletion is blocked while cloud sync enrollment is active")
+	ErrObservationNotFound    = errors.New("observation not found")
 	ErrPromptNotFound         = errors.New("prompt not found")
 )
 
@@ -159,6 +161,7 @@ type AddPromptParams struct {
 
 const (
 	DefaultSyncTargetKey = "cloud"
+	LocalChunkTargetKey  = "local"
 
 	SyncLifecycleIdle     = "idle"
 	SyncLifecyclePending  = "pending"
@@ -187,6 +190,8 @@ type SyncState struct {
 	BackoffUntil        *string `json:"backoff_until,omitempty"`
 	LeaseOwner          *string `json:"lease_owner,omitempty"`
 	LeaseUntil          *string `json:"lease_until,omitempty"`
+	ReasonCode          *string `json:"reason_code,omitempty"`
+	ReasonMessage       *string `json:"reason_message,omitempty"`
 	LastError           *string `json:"last_error,omitempty"`
 	UpdatedAt           string  `json:"updated_at"`
 }
@@ -214,30 +219,40 @@ type syncSessionPayload struct {
 	ID        string  `json:"id"`
 	Project   string  `json:"project"`
 	Directory string  `json:"directory"`
+	StartedAt string  `json:"started_at,omitempty"`
 	EndedAt   *string `json:"ended_at,omitempty"`
 	Summary   *string `json:"summary,omitempty"`
 }
 
 type syncObservationPayload struct {
-	SyncID     string  `json:"sync_id"`
-	SessionID  string  `json:"session_id"`
-	Type       string  `json:"type"`
-	Title      string  `json:"title"`
-	Content    string  `json:"content"`
-	ToolName   *string `json:"tool_name,omitempty"`
-	Project    *string `json:"project,omitempty"`
-	Scope      string  `json:"scope"`
-	TopicKey   *string `json:"topic_key,omitempty"`
-	Deleted    bool    `json:"deleted,omitempty"`
-	DeletedAt  *string `json:"deleted_at,omitempty"`
-	HardDelete bool    `json:"hard_delete,omitempty"`
+	SyncID         string  `json:"sync_id"`
+	SessionID      string  `json:"session_id"`
+	Type           string  `json:"type"`
+	Title          string  `json:"title"`
+	Content        string  `json:"content"`
+	ToolName       *string `json:"tool_name,omitempty"`
+	Project        *string `json:"project,omitempty"`
+	Scope          string  `json:"scope"`
+	TopicKey       *string `json:"topic_key,omitempty"`
+	RevisionCount  int     `json:"revision_count"`
+	DuplicateCount int     `json:"duplicate_count"`
+	LastSeenAt     *string `json:"last_seen_at,omitempty"`
+	CreatedAt      string  `json:"created_at,omitempty"`
+	UpdatedAt      string  `json:"updated_at,omitempty"`
+	Deleted        bool    `json:"deleted,omitempty"`
+	DeletedAt      *string `json:"deleted_at,omitempty"`
+	HardDelete     bool    `json:"hard_delete,omitempty"`
 }
 
 type syncPromptPayload struct {
-	SyncID    string  `json:"sync_id"`
-	SessionID string  `json:"session_id"`
-	Content   string  `json:"content"`
-	Project   *string `json:"project,omitempty"`
+	SyncID     string  `json:"sync_id"`
+	SessionID  string  `json:"session_id"`
+	Content    string  `json:"content"`
+	Project    *string `json:"project,omitempty"`
+	CreatedAt  string  `json:"created_at,omitempty"`
+	Deleted    bool    `json:"deleted,omitempty"`
+	DeletedAt  *string `json:"deleted_at,omitempty"`
+	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
 // ExportData is the full serializable dump of the engram database.
@@ -507,6 +522,13 @@ func (s *Store) migrate() error {
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 
+			CREATE TABLE IF NOT EXISTS prompt_tombstones (
+				sync_id    TEXT PRIMARY KEY,
+				session_id TEXT,
+				project    TEXT,
+				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
 		CREATE INDEX IF NOT EXISTS idx_prompts_session ON user_prompts(session_id);
 		CREATE INDEX IF NOT EXISTS idx_prompts_project ON user_prompts(project);
 		CREATE INDEX IF NOT EXISTS idx_prompts_created ON user_prompts(created_at DESC);
@@ -519,8 +541,10 @@ func (s *Store) migrate() error {
 		);
 
 			CREATE TABLE IF NOT EXISTS sync_chunks (
-				chunk_id    TEXT PRIMARY KEY,
-				imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+				target_key  TEXT NOT NULL DEFAULT 'local',
+				chunk_id    TEXT NOT NULL,
+				imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+				PRIMARY KEY (target_key, chunk_id)
 			);
 
 			CREATE TABLE IF NOT EXISTS sync_state (
@@ -589,6 +613,7 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_obs_deleted ON observations(deleted_at);
 		CREATE INDEX IF NOT EXISTS idx_obs_dedupe ON observations(normalized_hash, project, scope, type, title, created_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_prompts_sync_id ON user_prompts(sync_id);
+		CREATE INDEX IF NOT EXISTS idx_prompt_tombstones_project ON prompt_tombstones(project, deleted_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_target_seq ON sync_mutations(target_key, seq);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_pending ON sync_mutations(target_key, acked_at, seq);
 	`); err != nil {
@@ -597,6 +622,15 @@ func (s *Store) migrate() error {
 
 	// Project-scoped sync: add project column to sync_mutations and enrollment table.
 	if err := s.addColumnIfNotExists("sync_mutations", "project", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfNotExists("sync_state", "reason_code", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfNotExists("sync_state", "reason_message", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.migrateSyncChunksTable(); err != nil {
 		return err
 	}
 	if _, err := s.execHook(s.db, `
@@ -613,6 +647,19 @@ func (s *Store) migrate() error {
 		UPDATE sync_mutations
 		SET project = COALESCE(json_extract(payload, '$.project'), '')
 		WHERE project = '' AND payload != ''
+	`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_mutations
+		SET project = COALESCE((
+			SELECT sessions.project
+			FROM sessions
+			WHERE sessions.id = json_extract(sync_mutations.payload, '$.session_id')
+		), '')
+		WHERE project = ''
+		  AND payload != ''
+		  AND ifnull(json_extract(payload, '$.session_id'), '') != ''
 	`); err != nil {
 		return err
 	}
@@ -637,6 +684,9 @@ func (s *Store) migrate() error {
 	}
 
 	if _, err := s.execHook(s.db, `UPDATE user_prompts SET project = '' WHERE project IS NULL`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE prompt_tombstones SET project = '' WHERE project IS NULL`); err != nil {
 		return err
 	}
 	if _, err := s.execHook(s.db, `UPDATE user_prompts SET sync_id = 'prompt-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
@@ -772,10 +822,15 @@ func (s *Store) CreateSession(id, project, directory string) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
 		}
+		var startedAt string
+		if err := tx.QueryRow(`SELECT started_at FROM sessions WHERE id = ?`, id).Scan(&startedAt); err != nil {
+			return err
+		}
 		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
 			ID:        id,
 			Project:   project,
 			Directory: directory,
+			StartedAt: startedAt,
 		})
 	})
 }
@@ -797,13 +852,13 @@ func (s *Store) EndSession(id string, summary string) error {
 			return nil
 		}
 
-		var endedAt string
+		var startedAt, endedAt string
 		var project, directory string
 		var storedSummary *string
 		if err := tx.QueryRow(
-			`SELECT project, directory, ended_at, summary FROM sessions WHERE id = ?`,
+			`SELECT project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
 			id,
-		).Scan(&project, &directory, &endedAt, &storedSummary); err != nil {
+		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
 			return err
 		}
 
@@ -811,6 +866,7 @@ func (s *Store) EndSession(id string, summary string) error {
 			ID:        id,
 			Project:   project,
 			Directory: directory,
+			StartedAt: startedAt,
 			EndedAt:   &endedAt,
 			Summary:   storedSummary,
 		})
@@ -1142,11 +1198,19 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 		if err != nil {
 			return err
 		}
+		var createdAt string
+		if err := tx.QueryRow(`SELECT created_at FROM user_prompts WHERE id = ?`, promptID).Scan(&createdAt); err != nil {
+			return err
+		}
+		if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
+			return err
+		}
 		return s.enqueueSyncMutationTx(tx, SyncEntityPrompt, syncID, SyncOpUpsert, syncPromptPayload{
 			SyncID:    syncID,
 			SessionID: p.SessionID,
 			Content:   content,
 			Project:   nullableString(p.Project),
+			CreatedAt: createdAt,
 		})
 	})
 	if err != nil {
@@ -1236,6 +1300,8 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // DeleteSession hard-deletes a session and its prompts.
 // It returns ErrSessionHasObservations if the session has any observations
 // (including soft-deleted ones) to prevent orphaned rows.
+// It returns ErrSessionDeleteBlocked when the session's project is currently
+// enrolled for cloud sync, to avoid local-only deletes diverging from cloud state.
 // It returns ErrSessionNotFound if no session with that ID exists.
 //
 // Note: this delete only removes local rows. It does not enqueue a delete
@@ -1244,6 +1310,24 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // may recreate the deleted rows locally.
 func (s *Store) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
+		var project string
+		if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+			}
+			return fmt.Errorf("delete session: load session: %w", err)
+		}
+
+		var enrolled int
+		if err := tx.QueryRow(`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, project).Scan(&enrolled); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("delete session: check enrollment: %w", err)
+			}
+		}
+		if enrolled == 1 {
+			return fmt.Errorf("%w: session %q belongs to enrolled project %q", ErrSessionDeleteBlocked, id, project)
+		}
+
 		// Count ALL observations for the session, including soft-deleted ones,
 		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
 		var count int
@@ -1288,15 +1372,24 @@ func (s *Store) DeleteSession(id string) error {
 
 // ─── Delete Prompt ───────────────────────────────────────────────────────────
 
-// DeletePrompt hard-deletes a single prompt by ID.
+// DeletePrompt hard-deletes a single prompt by ID and records a sync tombstone.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
-//
-// Note: this delete only removes local rows. It does not enqueue a delete
-// sync mutation, but any previously enqueued mutations for the prompt
-// may still be synced later if autosync is enabled, and a later pull
-// may recreate the deleted row locally.
 func (s *Store) DeletePrompt(id int64) error {
 	return s.withTx(func(tx *sql.Tx) error {
+		var payload syncPromptPayload
+		var project string
+		if err := tx.QueryRow(`SELECT sync_id, session_id, ifnull(project, '') FROM user_prompts WHERE id = ?`, id).Scan(&payload.SyncID, &payload.SessionID, &project); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+			}
+			return fmt.Errorf("delete prompt: load row: %w", err)
+		}
+		payload.Project = nullableString(project)
+		now := Now()
+		payload.Deleted = true
+		payload.HardDelete = true
+		payload.DeletedAt = &now
+
 		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
 		if err != nil {
 			return fmt.Errorf("delete prompt: %w", err)
@@ -1307,6 +1400,17 @@ func (s *Store) DeletePrompt(id int64) error {
 		}
 		if n == 0 {
 			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+		}
+		if _, err := s.execHook(tx,
+			`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project, deleted_at = excluded.deleted_at`,
+			payload.SyncID, payload.SessionID, payload.Project, now,
+		); err != nil {
+			return fmt.Errorf("delete prompt: upsert tombstone: %w", err)
+		}
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return fmt.Errorf("delete prompt: enqueue mutation: %w", err)
 		}
 		return nil
 	})
@@ -1408,7 +1512,7 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		obs, err := s.getObservationTx(tx, id)
 		if err == sql.ErrNoRows {
-			return nil
+			return ErrObservationNotFound
 		}
 		if err != nil {
 			return err
@@ -1436,6 +1540,8 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 
 		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpDelete, syncObservationPayload{
 			SyncID:     obs.SyncID,
+			SessionID:  obs.SessionID,
+			Project:    obs.Project,
 			Deleted:    true,
 			DeletedAt:  &deletedAt,
 			HardDelete: hardDelete,
@@ -1763,14 +1869,49 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *Store) Export() (*ExportData, error) {
+	return s.exportWithProjectScope("")
+}
+
+// ExportProject returns an export restricted to records relevant to a single
+// normalized project. This avoids full-database exports when only one project
+// needs to sync.
+func (s *Store) ExportProject(project string) (*ExportData, error) {
+	normalizedProject, _ := NormalizeProject(project)
+	normalizedProject = strings.TrimSpace(normalizedProject)
+	if normalizedProject == "" {
+		return nil, fmt.Errorf("project is required")
+	}
+	return s.exportWithProjectScope(normalizedProject)
+}
+
+func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 	data := &ExportData{
 		Version:    "0.1.0",
 		ExportedAt: Now(),
 	}
 
+	sessionQuery := "SELECT id, project, directory, started_at, ended_at, summary FROM sessions"
+	sessionArgs := []any{}
+	if project != "" {
+		sessionQuery += `
+			WHERE project = ?
+			   OR id IN (
+				SELECT session_id FROM observations
+				 WHERE ifnull(project, '') = ?
+				    OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))
+				UNION
+				SELECT session_id FROM user_prompts
+				 WHERE ifnull(project, '') = ?
+				    OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))
+			)`
+		sessionArgs = append(sessionArgs, project, project, project, project, project)
+	}
+	sessionQuery += " ORDER BY started_at"
+
 	// Sessions
 	rows, err := s.queryItHook(s.db,
-		"SELECT id, project, directory, started_at, ended_at, summary FROM sessions ORDER BY started_at",
+		sessionQuery,
+		sessionArgs...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("export sessions: %w", err)
@@ -1788,11 +1929,18 @@ func (s *Store) Export() (*ExportData, error) {
 	}
 
 	// Observations
-	obsRows, err := s.queryItHook(s.db,
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
-		 FROM observations ORDER BY id`,
-	)
+	obsQuery := `SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
+	        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+	 FROM observations`
+	obsArgs := []any{}
+	if project != "" {
+		obsQuery += `
+			WHERE ifnull(project, '') = ?
+			   OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))`
+		obsArgs = append(obsArgs, project, project)
+	}
+	obsQuery += " ORDER BY id"
+	obsRows, err := s.queryItHook(s.db, obsQuery, obsArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("export observations: %w", err)
 	}
@@ -1813,9 +1961,16 @@ func (s *Store) Export() (*ExportData, error) {
 	}
 
 	// Prompts
-	promptRows, err := s.queryItHook(s.db,
-		"SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at FROM user_prompts ORDER BY id",
-	)
+	promptQuery := "SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at FROM user_prompts"
+	promptArgs := []any{}
+	if project != "" {
+		promptQuery += `
+			WHERE ifnull(project, '') = ?
+			   OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))`
+		promptArgs = append(promptArgs, project, project)
+	}
+	promptQuery += " ORDER BY id"
+	promptRows, err := s.queryItHook(s.db, promptQuery, promptArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("export prompts: %w", err)
 	}
@@ -1913,9 +2068,15 @@ type ImportResult struct {
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
 
-// GetSyncedChunks returns a set of chunk IDs that have been imported/exported.
+// GetSyncedChunks returns local-target chunk IDs for backwards compatibility.
 func (s *Store) GetSyncedChunks() (map[string]bool, error) {
-	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks")
+	return s.GetSyncedChunksForTarget(LocalChunkTargetKey)
+}
+
+// GetSyncedChunksForTarget returns chunk IDs tracked for a specific sync target.
+func (s *Store) GetSyncedChunksForTarget(targetKey string) (map[string]bool, error) {
+	targetKey = normalizeChunkTargetKey(targetKey)
+	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks WHERE target_key = ?", targetKey)
 	if err != nil {
 		return nil, fmt.Errorf("get synced chunks: %w", err)
 	}
@@ -1932,11 +2093,17 @@ func (s *Store) GetSyncedChunks() (map[string]bool, error) {
 	return chunks, rows.Err()
 }
 
-// RecordSyncedChunk marks a chunk as imported/exported so it won't be processed again.
+// RecordSyncedChunk marks a local-target chunk as imported/exported.
 func (s *Store) RecordSyncedChunk(chunkID string) error {
+	return s.RecordSyncedChunkForTarget(LocalChunkTargetKey, chunkID)
+}
+
+// RecordSyncedChunkForTarget marks a chunk as imported/exported for a target.
+func (s *Store) RecordSyncedChunkForTarget(targetKey, chunkID string) error {
+	targetKey = normalizeChunkTargetKey(targetKey)
 	_, err := s.execHook(s.db,
-		"INSERT OR IGNORE INTO sync_chunks (chunk_id) VALUES (?)",
-		chunkID,
+		"INSERT OR IGNORE INTO sync_chunks (target_key, chunk_id) VALUES (?, ?)",
+		targetKey, chunkID,
 	)
 	return err
 }
@@ -1982,6 +2149,36 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	return mutations, rows.Err()
 }
 
+func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]SyncMutation, error) {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.queryItHook(s.db, `
+		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
+		FROM sync_mutations sm
+		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL
+		  AND sm.seq > ?
+		  AND (sm.project = '' OR sep.project IS NOT NULL)
+		ORDER BY sm.seq ASC
+		LIMIT ?`, targetKey, afterSeq, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mutations := make([]SyncMutation, 0, limit)
+	for rows.Next() {
+		var mutation SyncMutation
+		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, mutation)
+	}
+	return mutations, rows.Err()
+}
+
 // SkipAckNonEnrolledMutations acks (marks as skipped) all pending mutations
 // that belong to non-enrolled projects, preventing journal bloat. Empty-project
 // mutations are never skipped — they always sync regardless of enrollment.
@@ -2008,6 +2205,35 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 	}
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
+		affectedProjects := map[string]struct{}{}
+		if targetKey == DefaultSyncTargetKey {
+			rows, err := s.queryItHook(tx,
+				`SELECT DISTINCT ifnull(project, '') FROM sync_mutations
+				 WHERE target_key = ? AND seq <= ? AND acked_at IS NULL`,
+				targetKey, lastAckedSeq,
+			)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var project string
+				if err := rows.Scan(&project); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				project, _ = NormalizeProject(project)
+				project = strings.TrimSpace(project)
+				if project != "" {
+					affectedProjects[project] = struct{}{}
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			_ = rows.Close()
+		}
+
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
 			return err
@@ -2026,13 +2252,36 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 		if acked >= state.LastEnqueuedSeq {
 			lifecycle = SyncLifecycleHealthy
 		}
-		_, err = s.execHook(tx,
-			`UPDATE sync_state
-			 SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
-			 WHERE target_key = ?`,
-			acked, lifecycle, targetKey,
-		)
-		return err
+		if isActivelyDegradedState(state, time.Now().UTC()) {
+			lifecycle = SyncLifecycleDegraded
+		}
+		if lifecycle == SyncLifecycleDegraded {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state
+				 SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
+				 WHERE target_key = ?`,
+				acked, lifecycle, targetKey,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state
+				 SET last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+				 WHERE target_key = ?`,
+				acked, lifecycle, targetKey,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		if targetKey != DefaultSyncTargetKey {
+			return nil
+		}
+		for project := range affectedProjects {
+			if err := s.refreshProjectSyncStateTx(tx, project); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -2044,6 +2293,31 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 	}
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
+		affectedProjects := map[string]struct{}{}
+		if targetKey == DefaultSyncTargetKey {
+			for _, seq := range seqs {
+				if seq <= 0 {
+					continue
+				}
+				var project string
+				err := tx.QueryRow(
+					`SELECT ifnull(project, '') FROM sync_mutations WHERE target_key = ? AND seq = ?`,
+					targetKey, seq,
+				).Scan(&project)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				project, _ = NormalizeProject(project)
+				project = strings.TrimSpace(project)
+				if project != "" {
+					affectedProjects[project] = struct{}{}
+				}
+			}
+		}
+
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
 			return err
@@ -2071,12 +2345,146 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 		if remaining == 0 {
 			lifecycle = SyncLifecycleHealthy
 		}
-		_, err = s.execHook(tx,
-			`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now') WHERE target_key = ?`,
-			maxSeq, lifecycle, targetKey,
-		)
-		return err
+		if isActivelyDegradedState(state, time.Now().UTC()) {
+			lifecycle = SyncLifecycleDegraded
+		}
+		if lifecycle == SyncLifecycleDegraded {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now') WHERE target_key = ?`,
+				maxSeq, lifecycle, targetKey,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now') WHERE target_key = ?`,
+				maxSeq, lifecycle, targetKey,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		if targetKey != DefaultSyncTargetKey {
+			return nil
+		}
+		for project := range affectedProjects {
+			if err := s.refreshProjectSyncStateTx(tx, project); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+func (s *Store) HasPendingSyncMutationsForProject(project string) (bool, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return false, nil
+	}
+
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *Store) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	projectTargetKey := syncTargetKeyForProject(project)
+	state, err := s.getSyncStateTx(tx, projectTargetKey)
+	if err != nil {
+		return err
+	}
+
+	var maxAckedSeq int64
+	if err := tx.QueryRow(
+		`SELECT ifnull(MAX(seq), 0)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ? AND acked_at IS NOT NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&maxAckedSeq); err != nil {
+		return err
+	}
+	if maxAckedSeq < state.LastAckedSeq {
+		maxAckedSeq = state.LastAckedSeq
+	}
+
+	var maxEnqueuedSeq int64
+	if err := tx.QueryRow(
+		`SELECT ifnull(MAX(seq), 0)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ?`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&maxEnqueuedSeq); err != nil {
+		return err
+	}
+	if maxEnqueuedSeq < state.LastEnqueuedSeq {
+		maxEnqueuedSeq = state.LastEnqueuedSeq
+	}
+
+	var pendingCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&pendingCount); err != nil {
+		return err
+	}
+
+	lifecycle := SyncLifecycleHealthy
+	if pendingCount > 0 {
+		lifecycle = SyncLifecyclePending
+	}
+	if isActivelyDegradedState(state, time.Now().UTC()) {
+		lifecycle = SyncLifecycleDegraded
+	}
+
+	if lifecycle == SyncLifecycleDegraded {
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_enqueued_seq = ?, last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			maxEnqueuedSeq, maxAckedSeq, lifecycle, projectTargetKey,
+		)
+	} else {
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_enqueued_seq = ?, last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			maxEnqueuedSeq, maxAckedSeq, lifecycle, projectTargetKey,
+		)
+	}
+	return err
+}
+
+func isActivelyDegradedState(state *SyncState, now time.Time) bool {
+	if state == nil || state.Lifecycle != SyncLifecycleDegraded {
+		return false
+	}
+	reasonCode := strings.TrimSpace(derefString(state.ReasonCode))
+	switch reasonCode {
+	case "blocked_unenrolled", "paused", "auth_required", "policy_forbidden", "cloud_config_error":
+		return true
+	}
+	if state.BackoffUntil != nil {
+		if backoffUntil, err := time.Parse(time.RFC3339, strings.TrimSpace(*state.BackoffUntil)); err == nil && backoffUntil.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
@@ -2127,6 +2535,30 @@ func (s *Store) ReleaseSyncLease(targetKey, owner string) error {
 	return err
 }
 
+func (s *Store) MarkSyncBlocked(targetKey, reasonCode, message string) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+		_, err := s.execHook(tx,
+			`UPDATE sync_state
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = ?, reason_message = ?, last_error = ?, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			SyncLifecycleDegraded, reasonCode, message, message, targetKey,
+		)
+		return err
+	})
+}
+
+func (s *Store) MarkSyncPaused(targetKey, message string) error {
+	return s.MarkSyncBlocked(targetKey, "paused", message)
+}
+
+func (s *Store) MarkSyncAuthRequired(targetKey, message string) error {
+	return s.MarkSyncBlocked(targetKey, "auth_required", message)
+}
+
 func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	backoff := backoffUntil.UTC().Format(time.RFC3339)
@@ -2137,9 +2569,9 @@ func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Tim
 		}
 		_, err = s.execHook(tx,
 			`UPDATE sync_state
-			 SET lifecycle = ?, consecutive_failures = ?, backoff_until = ?, last_error = ?, updated_at = datetime('now')
+			 SET lifecycle = ?, consecutive_failures = ?, backoff_until = ?, reason_code = ?, reason_message = ?, last_error = ?, updated_at = datetime('now')
 			 WHERE target_key = ?`,
-			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, message, targetKey,
+			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, "transport_failed", message, message, targetKey,
 		)
 		return err
 	})
@@ -2147,13 +2579,34 @@ func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Tim
 
 func (s *Store) MarkSyncHealthy(targetKey string) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
-	_, err := s.execHook(s.db,
-		`UPDATE sync_state
-		 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, last_error = NULL, updated_at = datetime('now')
-		 WHERE target_key = ?`,
-		SyncLifecycleHealthy, targetKey,
-	)
-	return err
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+		_, err := s.execHook(tx,
+			`UPDATE sync_state
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			SyncLifecycleHealthy, targetKey,
+		)
+		return err
+	})
+}
+
+func (s *Store) MarkSyncPending(targetKey string) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+		_, err := s.execHook(tx,
+			`UPDATE sync_state
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			SyncLifecyclePending, targetKey,
+		)
+		return err
+	})
 }
 
 func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
@@ -2167,46 +2620,72 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 			return nil
 		}
 
-		switch mutation.Entity {
-		case SyncEntitySession:
-			var payload syncSessionPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if err := s.applySessionPayloadTx(tx, payload); err != nil {
-				return err
-			}
-		case SyncEntityObservation:
-			var payload syncObservationPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if mutation.Op == SyncOpDelete {
-				if err := s.applyObservationDeleteTx(tx, payload); err != nil {
-					return err
-				}
-			} else {
-				if err := s.applyObservationUpsertTx(tx, payload); err != nil {
-					return err
-				}
-			}
-		case SyncEntityPrompt:
-			var payload syncPromptPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if err := s.applyPromptUpsertTx(tx, payload); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unknown sync entity %q", mutation.Entity)
+		if err := s.applyPulledMutationTx(tx, mutation); err != nil {
+			return err
 		}
 
 		_, err = s.execHook(tx,
 			`UPDATE sync_state
-			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, last_error = NULL, updated_at = datetime('now')
+			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
 			 WHERE target_key = ?`,
 			mutation.Seq, SyncLifecycleHealthy, targetKey,
+		)
+		return err
+	})
+}
+
+// ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
+// and records the chunk as synced in the same transaction. This guarantees
+// retry safety: a failed chunk import leaves no partial semantic mutations.
+func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	chunkTargetKey := normalizeChunkTargetKey(targetKey)
+	chunkID = strings.TrimSpace(chunkID)
+	if chunkID == "" {
+		return fmt.Errorf("chunk id is required")
+	}
+
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+
+		var alreadyImported int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_chunks WHERE target_key = ? AND chunk_id = ?`, chunkTargetKey, chunkID).Scan(&alreadyImported); err != nil {
+			return err
+		}
+		if alreadyImported > 0 {
+			return nil
+		}
+
+		state, err := s.getSyncStateTx(tx, targetKey)
+		if err != nil {
+			return err
+		}
+
+		seq := state.LastPulledSeq
+		for i, mutation := range mutations {
+			seq++
+			mutation.Seq = seq
+			mutation.TargetKey = targetKey
+			mutation.Source = SyncSourceRemote
+			if err := s.applyPulledMutationTx(tx, mutation); err != nil {
+				return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+			}
+		}
+
+		if _, err := s.execHook(tx,
+			`INSERT OR IGNORE INTO sync_chunks (target_key, chunk_id) VALUES (?, ?)`,
+			chunkTargetKey, chunkID,
+		); err != nil {
+			return err
+		}
+
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			seq, SyncLifecycleHealthy, targetKey,
 		)
 		return err
 	})
@@ -2231,6 +2710,7 @@ func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 // EnrollProject registers a project for cloud sync. Idempotent — re-enrolling
 // an already-enrolled project is a no-op.
 func (s *Store) EnrollProject(project string) error {
+	project, _ = NormalizeProject(project)
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2256,6 +2736,7 @@ func (s *Store) EnrollProject(project string) error {
 // UnenrollProject removes a project from cloud sync enrollment. Idempotent —
 // unenrolling a non-enrolled project is a no-op.
 func (s *Store) UnenrollProject(project string) error {
+	project, _ = NormalizeProject(project)
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2289,6 +2770,10 @@ func (s *Store) ListEnrolledProjects() ([]EnrolledProject, error) {
 
 // IsProjectEnrolled returns true if the given project is enrolled for cloud sync.
 func (s *Store) IsProjectEnrolled(project string) (bool, error) {
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return false, nil
+	}
 	var exists int
 	err := s.db.QueryRow(
 		`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`,
@@ -2685,10 +3170,10 @@ func (s *Store) ensureSyncState(targetKey string) error {
 func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
 	row := s.db.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -2703,10 +3188,10 @@ func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error)
 	}
 	row := tx.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -2755,7 +3240,7 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 
 func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
-		SELECT id, project, directory, ended_at, summary
+		SELECT id, project, directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
 		  AND NOT EXISTS (
@@ -2776,7 +3261,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 
 	for rows.Next() {
 		var payload syncSessionPayload
-		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.EndedAt, &payload.Summary); err != nil {
+		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
 			return err
 		}
 		if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload); err != nil {
@@ -2788,20 +3273,25 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 
 func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
-		SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key
-		FROM observations
-		WHERE ifnull(project, '') = ?
+		SELECT o.sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project, o.scope, o.topic_key,
+		       o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at
+		FROM observations o
+		LEFT JOIN sessions s ON s.id = o.session_id
+		WHERE (
+			ifnull(o.project, '') = ?
+			OR (ifnull(o.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
 		  AND deleted_at IS NULL
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
 			WHERE sm.target_key = ?
 			  AND sm.entity = ?
-			  AND sm.entity_key = observations.sync_id
+			  AND sm.entity_key = o.sync_id
 			  AND sm.source = ?
 		  )
-		ORDER BY id ASC`,
-		project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
+		ORDER BY o.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
@@ -2810,31 +3300,91 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 
 	for rows.Next() {
 		var payload syncObservationPayload
-		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Type, &payload.Title, &payload.Content, &payload.ToolName, &payload.Project, &payload.Scope, &payload.TopicKey); err != nil {
+		if err := rows.Scan(
+			&payload.SyncID,
+			&payload.SessionID,
+			&payload.Type,
+			&payload.Title,
+			&payload.Content,
+			&payload.ToolName,
+			&payload.Project,
+			&payload.Scope,
+			&payload.TopicKey,
+			&payload.RevisionCount,
+			&payload.DuplicateCount,
+			&payload.LastSeenAt,
+			&payload.CreatedAt,
+			&payload.UpdatedAt,
+		); err != nil {
 			return err
 		}
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
-}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
-func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
-	rows, err := s.queryItHook(tx, `
-		SELECT sync_id, session_id, content, project
-		FROM user_prompts
-		WHERE ifnull(project, '') = ?
+	deletedRows, err := s.queryItHook(tx, `
+		SELECT o.sync_id, o.session_id, o.project, o.deleted_at
+		FROM observations o
+		LEFT JOIN sessions s ON s.id = o.session_id
+		WHERE (
+			ifnull(o.project, '') = ?
+			OR (ifnull(o.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND o.deleted_at IS NOT NULL
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
 			WHERE sm.target_key = ?
 			  AND sm.entity = ?
-			  AND sm.entity_key = user_prompts.sync_id
+			  AND sm.entity_key = o.sync_id
+			  AND sm.op = ?
 			  AND sm.source = ?
 		  )
-		ORDER BY id ASC`,
-		project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+		ORDER BY o.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal,
+	)
+	if err != nil {
+		return err
+	}
+	defer deletedRows.Close()
+
+	for deletedRows.Next() {
+		var payload syncObservationPayload
+		if err := deletedRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt); err != nil {
+			return err
+		}
+		payload.Deleted = true
+		payload.HardDelete = false
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return err
+		}
+	}
+	return deletedRows.Err()
+}
+
+func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
+	rows, err := s.queryItHook(tx, `
+		SELECT p.sync_id, p.session_id, p.content, p.project, p.created_at
+		FROM user_prompts p
+		LEFT JOIN sessions s ON s.id = p.session_id
+		WHERE (
+			ifnull(p.project, '') = ?
+			OR (ifnull(p.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM sync_mutations sm
+			WHERE sm.target_key = ?
+			  AND sm.entity = ?
+			  AND sm.entity_key = p.sync_id
+			  AND sm.source = ?
+		  )
+		ORDER BY p.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
@@ -2843,14 +3393,54 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 
 	for rows.Next() {
 		var payload syncPromptPayload
-		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project); err != nil {
+		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt); err != nil {
 			return err
 		}
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	tombstoneRows, err := s.queryItHook(tx, `
+		SELECT prompt_tombstones.sync_id, prompt_tombstones.session_id, prompt_tombstones.project, prompt_tombstones.deleted_at
+		FROM prompt_tombstones
+		LEFT JOIN sessions s ON s.id = prompt_tombstones.session_id
+		WHERE (
+			ifnull(prompt_tombstones.project, '') = ?
+			OR (ifnull(prompt_tombstones.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM sync_mutations sm
+			WHERE sm.target_key = ?
+			  AND sm.entity = ?
+			  AND sm.entity_key = prompt_tombstones.sync_id
+			  AND sm.source = ?
+			  AND sm.op = ?
+		  )
+		ORDER BY deleted_at ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete,
+	)
+	if err != nil {
+		return err
+	}
+	defer tombstoneRows.Close()
+
+	for tombstoneRows.Next() {
+		var payload syncPromptPayload
+		if err := tombstoneRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt); err != nil {
+			return err
+		}
+		payload.Deleted = true
+		payload.HardDelete = true
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return err
+		}
+	}
+	return tombstoneRows.Err()
 }
 
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
@@ -2859,6 +3449,17 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 		return err
 	}
 	project := extractProjectFromPayload(payload)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	if project == "" {
+		sessionID := extractSessionIDFromPayload(payload)
+		if sessionID != "" {
+			if derived, err := s.resolveSessionProjectTx(tx, sessionID); err != nil {
+				return err
+			} else {
+				project = derived
+			}
+		}
+	}
 	if _, err := s.execHook(tx,
 		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
 		DefaultSyncTargetKey, SyncLifecycleIdle,
@@ -2883,7 +3484,103 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 		 WHERE target_key = ?`,
 		SyncLifecyclePending, seq, DefaultSyncTargetKey,
 	)
+	if err != nil {
+		return err
+	}
+	if project == "" {
+		return nil
+	}
+	projectTargetKey := syncTargetKeyForProject(project)
+	if _, err := s.execHook(tx,
+		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
+		projectTargetKey, SyncLifecycleIdle,
+	); err != nil {
+		return err
+	}
+	_, err = s.execHook(tx,
+		`UPDATE sync_state
+		 SET lifecycle = ?, last_enqueued_seq = ?, updated_at = datetime('now')
+		 WHERE target_key = ?`,
+		SyncLifecyclePending, seq, projectTargetKey,
+	)
 	return err
+}
+
+func syncTargetKeyForProject(project string) string {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return DefaultSyncTargetKey
+	}
+	return fmt.Sprintf("%s:%s", DefaultSyncTargetKey, project)
+}
+
+func extractSessionIDFromPayload(payload any) string {
+	switch p := payload.(type) {
+	case syncObservationPayload:
+		return strings.TrimSpace(p.SessionID)
+	case syncPromptPayload:
+		return strings.TrimSpace(p.SessionID)
+	default:
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return ""
+		}
+		var generic struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(data, &generic); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(generic.SessionID)
+	}
+}
+
+func (s *Store) resolveSessionProjectTx(tx *sql.Tx, sessionID string) (string, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return "", nil
+	}
+	var project string
+	err := tx.QueryRow(`SELECT ifnull(project, '') FROM sessions WHERE id = ?`, sessionID).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	return project, nil
+}
+
+func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
+	switch mutation.Entity {
+	case SyncEntitySession:
+		var payload syncSessionPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		return s.applySessionPayloadTx(tx, payload)
+	case SyncEntityObservation:
+		var payload syncObservationPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		if mutation.Op == SyncOpDelete {
+			return s.applyObservationDeleteTx(tx, payload)
+		}
+		return s.applyObservationUpsertTx(tx, payload)
+	case SyncEntityPrompt:
+		var payload syncPromptPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		if mutation.Op == SyncOpDelete || payload.Deleted || payload.HardDelete {
+			return s.applyPromptDeleteTx(tx, payload)
+		}
+		return s.applyPromptUpsertTx(tx, payload)
+	default:
+		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
+	}
 }
 
 // extractProjectFromPayload returns the project string from a sync payload struct.
@@ -2965,50 +3662,112 @@ func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDelet
 
 func observationPayloadFromObservation(obs *Observation) syncObservationPayload {
 	return syncObservationPayload{
-		SyncID:    obs.SyncID,
-		SessionID: obs.SessionID,
-		Type:      obs.Type,
-		Title:     obs.Title,
-		Content:   obs.Content,
-		ToolName:  obs.ToolName,
-		Project:   obs.Project,
-		Scope:     obs.Scope,
-		TopicKey:  obs.TopicKey,
+		SyncID:         obs.SyncID,
+		SessionID:      obs.SessionID,
+		Type:           obs.Type,
+		Title:          obs.Title,
+		Content:        obs.Content,
+		ToolName:       obs.ToolName,
+		Project:        obs.Project,
+		Scope:          obs.Scope,
+		TopicKey:       obs.TopicKey,
+		RevisionCount:  obs.RevisionCount,
+		DuplicateCount: obs.DuplicateCount,
+		LastSeenAt:     obs.LastSeenAt,
+		CreatedAt:      obs.CreatedAt,
+		UpdatedAt:      obs.UpdatedAt,
 	}
 }
 
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, directory, ended_at, summary)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO sessions (id, project, directory, started_at, ended_at, summary)
+		 VALUES (?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project = excluded.project,
 		   directory = excluded.directory,
+		   started_at = COALESCE(NULLIF(excluded.started_at, ''), sessions.started_at),
 		   ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
 		   summary = COALESCE(excluded.summary, sessions.summary)`,
-		payload.ID, payload.Project, payload.Directory, payload.EndedAt, payload.Summary,
+		payload.ID, payload.Project, payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
 	)
 	return err
 }
 
 func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {
+	revisionCount := maxInt(payload.RevisionCount, 1)
+	duplicateCount := maxInt(payload.DuplicateCount, 1)
+	createdAt := strings.TrimSpace(payload.CreatedAt)
+	updatedAt := strings.TrimSpace(payload.UpdatedAt)
+	if createdAt == "" {
+		createdAt = Now()
+	}
+	if updatedAt == "" {
+		updatedAt = createdAt
+	}
+
 	existing, err := s.getObservationBySyncIDTx(tx, payload.SyncID, true)
 	if err == sql.ErrNoRows {
 		_, err = s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), NULL)`,
-			payload.SyncID, payload.SessionID, payload.Type, payload.Title, payload.Content, payload.ToolName, payload.Project, normalizeScope(payload.Scope), payload.TopicKey, hashNormalized(payload.Content),
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			payload.SyncID,
+			payload.SessionID,
+			payload.Type,
+			payload.Title,
+			payload.Content,
+			payload.ToolName,
+			payload.Project,
+			normalizeScope(payload.Scope),
+			payload.TopicKey,
+			hashNormalized(payload.Content),
+			revisionCount,
+			duplicateCount,
+			payload.LastSeenAt,
+			createdAt,
+			updatedAt,
 		)
 		return err
 	}
 	if err != nil {
 		return err
 	}
+
+	if payload.RevisionCount <= 0 {
+		revisionCount = maxInt(existing.RevisionCount, 1)
+	}
+	if payload.DuplicateCount <= 0 {
+		duplicateCount = maxInt(existing.DuplicateCount, 1)
+	}
+	if payload.LastSeenAt == nil {
+		payload.LastSeenAt = existing.LastSeenAt
+	}
+	if strings.TrimSpace(payload.CreatedAt) == "" {
+		createdAt = existing.CreatedAt
+	}
+	if strings.TrimSpace(payload.UpdatedAt) == "" {
+		updatedAt = existing.UpdatedAt
+	}
+
 	_, err = s.execHook(tx,
 		`UPDATE observations
-		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = revision_count + 1, updated_at = datetime('now'), deleted_at = NULL
+		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, created_at = ?, updated_at = ?, deleted_at = NULL
 		 WHERE id = ?`,
-		payload.SessionID, payload.Type, payload.Title, payload.Content, payload.ToolName, payload.Project, normalizeScope(payload.Scope), payload.TopicKey, hashNormalized(payload.Content), existing.ID,
+		payload.SessionID,
+		payload.Type,
+		payload.Title,
+		payload.Content,
+		payload.ToolName,
+		payload.Project,
+		normalizeScope(payload.Scope),
+		payload.TopicKey,
+		hashNormalized(payload.Content),
+		revisionCount,
+		duplicateCount,
+		payload.LastSeenAt,
+		createdAt,
+		updatedAt,
+		existing.ID,
 	)
 	return err
 }
@@ -3038,23 +3797,89 @@ func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayl
 }
 
 func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error {
+	var tombstoneDeletedAt string
+	err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID).Scan(&tombstoneDeletedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if isStalePromptUpsert(payload, tombstoneDeletedAt) {
+			return nil
+		}
+		if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID); err != nil {
+			return err
+		}
+	}
+
 	var existingID int64
-	err := tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
+	err = tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
 	if err == sql.ErrNoRows {
-		_, err = s.execHook(tx,
-			`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
-			payload.SyncID, payload.SessionID, payload.Content, payload.Project,
-		)
+		if strings.TrimSpace(payload.CreatedAt) == "" {
+			_, err = s.execHook(tx,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at) VALUES (?, ?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project, payload.CreatedAt,
+			)
+		}
 		return err
 	}
 	if err != nil {
 		return err
 	}
 	_, err = s.execHook(tx,
-		`UPDATE user_prompts SET session_id = ?, content = ?, project = ? WHERE id = ?`,
-		payload.SessionID, payload.Content, payload.Project, existingID,
+		`UPDATE user_prompts
+		 SET session_id = ?,
+		     content = ?,
+		     project = ?,
+		     created_at = CASE WHEN ? = '' THEN created_at ELSE ? END
+		 WHERE id = ?`,
+		payload.SessionID, payload.Content, payload.Project, strings.TrimSpace(payload.CreatedAt), payload.CreatedAt, existingID,
 	)
 	return err
+}
+
+func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error {
+	if strings.TrimSpace(payload.SyncID) == "" {
+		return nil
+	}
+	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, payload.SyncID); err != nil {
+		return err
+	}
+	deletedAt := payload.DeletedAt
+	if deletedAt == nil || strings.TrimSpace(*deletedAt) == "" {
+		now := Now()
+		deletedAt = &now
+	}
+	_, err := s.execHook(tx,
+		`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project, deleted_at = excluded.deleted_at`,
+		payload.SyncID, payload.SessionID, payload.Project, *deletedAt,
+	)
+	return err
+}
+
+func isStalePromptUpsert(payload syncPromptPayload, tombstoneDeletedAt string) bool {
+	upsertTime := normalizeComparableTimestamp(payload.CreatedAt)
+	if strings.TrimSpace(upsertTime) == "" {
+		return true
+	}
+	return upsertTime <= normalizeComparableTimestamp(tombstoneDeletedAt)
+}
+
+func normalizeComparableTimestamp(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return parsed.UTC().Format("2006-01-02 15:04:05")
+	}
+	return trimmed
 }
 
 func (s *Store) queryObservations(query string, args ...any) ([]Observation, error) {
@@ -3105,6 +3930,92 @@ func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) e
 
 	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition))
 	return err
+}
+
+func (s *Store) migrateSyncChunksTable() error {
+	rows, err := s.queryItHook(s.db, "PRAGMA table_info(sync_chunks)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasTargetKey := false
+	targetKeyPK := 0
+	chunkIDPK := 0
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		switch name {
+		case "target_key":
+			hasTargetKey = true
+			targetKeyPK = pk
+		case "chunk_id":
+			chunkIDPK = pk
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Already migrated: composite PK (target_key, chunk_id).
+	if hasTargetKey && targetKeyPK == 1 && chunkIDPK == 2 {
+		return nil
+	}
+
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := s.execHook(tx, `
+		CREATE TABLE IF NOT EXISTS sync_chunks_new (
+			target_key  TEXT NOT NULL DEFAULT 'local',
+			chunk_id    TEXT NOT NULL,
+			imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+			PRIMARY KEY (target_key, chunk_id)
+		)
+	`); err != nil {
+		return err
+	}
+
+	if hasTargetKey {
+		if _, err := s.execHook(tx, `
+			INSERT OR IGNORE INTO sync_chunks_new (target_key, chunk_id, imported_at)
+			SELECT CASE
+				WHEN trim(ifnull(target_key, '')) = '' THEN ?
+				ELSE trim(target_key)
+			END,
+			chunk_id,
+			imported_at
+			FROM sync_chunks
+		`, LocalChunkTargetKey); err != nil {
+			return err
+		}
+	} else {
+		if _, err := s.execHook(tx, `
+			INSERT OR IGNORE INTO sync_chunks_new (target_key, chunk_id, imported_at)
+			SELECT ?, chunk_id, imported_at
+			FROM sync_chunks
+		`, LocalChunkTargetKey); err != nil {
+			return err
+		}
+	}
+
+	if _, err := s.execHook(tx, `DROP TABLE sync_chunks`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(tx, `ALTER TABLE sync_chunks_new RENAME TO sync_chunks`); err != nil {
+		return err
+	}
+
+	return s.commitHook(tx)
 }
 
 func (s *Store) migrateLegacyObservationsTable() error {
@@ -3440,6 +4351,13 @@ func maxInt(a, b int) int {
 func normalizeSyncTargetKey(targetKey string) string {
 	if strings.TrimSpace(targetKey) == "" {
 		return DefaultSyncTargetKey
+	}
+	return strings.TrimSpace(strings.ToLower(targetKey))
+}
+
+func normalizeChunkTargetKey(targetKey string) string {
+	if strings.TrimSpace(targetKey) == "" {
+		return LocalChunkTargetKey
 	}
 	return strings.TrimSpace(strings.ToLower(targetKey))
 }

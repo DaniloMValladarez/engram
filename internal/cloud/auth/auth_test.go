@@ -1,0 +1,176 @@
+package auth
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
+)
+
+func TestNewServiceSecretValidation(t *testing.T) {
+	_, err := NewService(&cloudstore.CloudStore{}, "short")
+	if err == nil {
+		t.Fatal("expected jwt secret validation error")
+	}
+
+	_, err = NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("expected valid secret, got %v", err)
+	}
+}
+
+func TestAuthorizeBearerToken(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		token   string
+		header  string
+		wantErr bool
+	}{
+		{name: "no expected token is rejected", token: "", header: "", wantErr: true},
+		{name: "missing header with expected token", token: "abc", header: "", wantErr: true},
+		{name: "invalid bearer token", token: "abc", header: "Bearer nope", wantErr: true},
+		{name: "valid bearer token", token: "abc", header: "Bearer abc", wantErr: false},
+		{name: "valid lowercase bearer token", token: "abc", header: "bearer abc", wantErr: false},
+		{name: "valid mixed-case bearer token", token: "abc", header: "BeArEr abc", wantErr: false},
+		{name: "malformed bearer header with extra fields", token: "abc", header: "Bearer abc extra", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc.SetBearerToken(tt.token)
+			req := httptest.NewRequest("GET", "/sync/pull", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			err := svc.Authorize(req)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Authorize() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestAuthorizeProjectScope(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	if err := svc.AuthorizeProject("proj-a"); err == nil {
+		t.Fatal("expected failure when allowlist is not configured")
+	}
+
+	svc.SetAllowedProjects([]string{"proj-a", "proj-b"})
+	if err := svc.AuthorizeProject("PROJ-A"); err != nil {
+		t.Fatalf("expected normalized project to be allowed, got %v", err)
+	}
+	if err := svc.AuthorizeProject("proj-c"); err == nil {
+		t.Fatal("expected disallowed project to be rejected")
+	} else {
+		if !errors.Is(err, ErrProjectNotAllowed) {
+			t.Fatalf("expected ErrProjectNotAllowed, got %v", err)
+		}
+		if strings.Contains(err.Error(), "proj-a") || strings.Contains(err.Error(), "proj-b") {
+			t.Fatalf("project scope error must not leak allowlist, got %q", err.Error())
+		}
+	}
+}
+
+func TestDashboardSessionTokenRoundTrip(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	svc.SetBearerToken("secret-token")
+
+	now := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	signed, err := svc.MintDashboardSession("secret-token")
+	if err != nil {
+		t.Fatalf("mint dashboard session: %v", err)
+	}
+	if signed == "secret-token" {
+		t.Fatal("expected signed dashboard session token, got raw bearer token")
+	}
+	if strings.Contains(signed, "secret-token") {
+		t.Fatal("expected dashboard session token to never reveal raw bearer token")
+	}
+
+	parts := strings.Split(signed, ".")
+	if len(parts) != 2 {
+		t.Fatalf("expected signed token to have two parts, got %d", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("decode claims: %v", err)
+	}
+	if _, ok := claims["bearer"]; ok {
+		t.Fatal("expected dashboard session claims to omit raw bearer")
+	}
+
+	bearer, err := svc.ParseDashboardSession(signed)
+	if err != nil {
+		t.Fatalf("parse dashboard session: %v", err)
+	}
+	if bearer != "secret-token" {
+		t.Fatalf("expected bearer secret-token, got %q", bearer)
+	}
+}
+
+func TestDashboardSessionTokenRejectsTamperingAndExpiry(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	svc.SetBearerToken("secret-token")
+
+	issuedAt := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return issuedAt }
+
+	token, err := svc.MintDashboardSession("secret-token")
+	if err != nil {
+		t.Fatalf("mint dashboard session: %v", err)
+	}
+
+	if _, err := svc.ParseDashboardSession(token + "tampered"); !errors.Is(err, ErrInvalidDashboardSessionToken) {
+		t.Fatalf("expected tampered token to fail with ErrInvalidDashboardSessionToken, got %v", err)
+	}
+
+	svc.now = func() time.Time { return issuedAt.Add(9 * time.Hour) }
+	if _, err := svc.ParseDashboardSession(token); !errors.Is(err, ErrInvalidDashboardSessionToken) {
+		t.Fatalf("expected expired token to fail with ErrInvalidDashboardSessionToken, got %v", err)
+	}
+}
+
+func TestDashboardSessionTokenRejectsWhenConfiguredBearerChanges(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	svc.SetBearerToken("secret-token")
+
+	token, err := svc.MintDashboardSession("secret-token")
+	if err != nil {
+		t.Fatalf("mint dashboard session: %v", err)
+	}
+
+	svc.SetBearerToken("rotated-token")
+	if _, err := svc.ParseDashboardSession(token); !errors.Is(err, ErrInvalidDashboardSessionToken) {
+		t.Fatalf("expected token minted for old bearer to fail after rotation, got %v", err)
+	}
+}

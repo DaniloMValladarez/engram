@@ -43,7 +43,7 @@ For other docs:
 - **observations_fts** — FTS5 virtual table synced via triggers (`title`, `content`, `tool_name`, `type`, `project`)
 - **user_prompts** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `content`, `project`, `created_at`
 - **prompts_fts** — FTS5 virtual table synced via triggers (`content`, `project`)
-- **sync_chunks** — `chunk_id` (TEXT PK), `imported_at` — tracks which chunks have been imported to prevent duplicates
+- **sync_chunks** — `target_key` (TEXT), `chunk_id` (TEXT), `imported_at`; composite PK (`target_key`, `chunk_id`) for target-scoped chunk tracking
 
 ### SQLite Configuration
 
@@ -56,7 +56,10 @@ For other docs:
 
 ## HTTP API Endpoints
 
-All endpoints return JSON. Server listens on `127.0.0.1:7437`.
+The local Engram API endpoints documented in this section return JSON and listen on `127.0.0.1:7437`.
+Cloud dashboard routes (`engram cloud serve`) return HTML for browser flows (`/dashboard`, `/dashboard/login`).
+
+Engram is local-first: local SQLite is authoritative; cloud features are optional replication/enrollment controls.
 
 ### Health
 
@@ -67,6 +70,11 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `POST /sessions` — Create session. Body: `{id, project, directory}`
 - `POST /sessions/{id}/end` — End session. Body: `{summary}`
 - `GET /sessions/recent` — Recent sessions. Query: `?project=X&limit=N`
+- `DELETE /sessions/{id}` — Delete session
+  - `200` when deleted
+  - `404` when session does not exist
+  - `409` when session still has observations (delete/migrate observations first)
+  - `409` when the session's project is enrolled for cloud sync (session deletion is blocked to avoid local/cloud divergence)
 
 ### Observations
 
@@ -75,6 +83,8 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `GET /observations/{id}` — Get single observation by ID
 - `PATCH /observations/{id}` — Update fields. Body: `{title?, content?, type?, project?, scope?, topic_key?}`
 - `DELETE /observations/{id}` — Delete observation (`?hard=true` for hard delete, soft delete by default)
+  - `200` when deleted
+  - `404` when observation does not exist
 
 ### Search
 
@@ -89,6 +99,10 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `POST /prompts` — Save user prompt. Body: `{session_id, content, project?}`
 - `GET /prompts/recent` — Recent prompts. Query: `?project=X&limit=N`
 - `GET /prompts/search` — Search prompts. Query: `?q=QUERY&project=X&limit=N`
+- `DELETE /prompts/{id}` — Delete prompt
+  - `200` when deleted
+  - `400` for invalid prompt id
+  - `404` when prompt does not exist
 
 ### Context
 
@@ -96,11 +110,13 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 ### Passive Capture
 
-- `POST /observations/passive` — Extract structured learnings from text. Body: `{content, session_id?, project?}`
+- `POST /observations/passive` — Extract structured learnings from text. Body: `{content, session_id, project?}`
 
 ### Export / Import
 
 - `GET /export` — Export all data as JSON
+  - Optional `?project=<name>` for project-scoped export
+  - `400` when `project` is provided but blank/whitespace
 - `POST /import` — Import data from JSON. Body: ExportData JSON
 
 ### Stats
@@ -109,11 +125,25 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 ### Project Migration
 
-- `POST /projects/migrate` — Migrate observations between project names. Body: `{source, target}`
+- `POST /projects/migrate` — Migrate observations between project names. Body: `{old_project, new_project}`
 
 ### Sync Status
 
-- `GET /sync/status` — Chunk sync status (local vs remote counts, pending imports)
+- `GET /sync/status` — Runtime sync-state status for the local node.
+- In `engram serve`, sync status is wired to persisted SQLite sync state (project-scoped for detected/current project).
+- Response fields when provider is injected:
+  - `enabled`
+  - `phase`
+  - `last_error`
+  - `consecutive_failures`
+  - `backoff_until`
+  - `last_sync_at`
+  - `reason_code`
+  - `reason_message`
+- `enabled` semantics:
+  - `true` when cloud runtime is configured for the resolved + enrolled project, or when meaningful persisted sync state exists for that resolved project while runtime is not configured.
+  - `false` when no explicit project scope resolves, cloud runtime is malformed/missing, or enrollment/status checks fail.
+- Generic/embedded server usage may return the fallback `enabled=false` response if no provider is injected.
 
 ### Environment Variables
 
@@ -122,6 +152,95 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 | `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
 | `ENGRAM_PORT` | Override HTTP server port | `7437` |
 | `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
+
+### Cloud CLI (opt-in)
+
+- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state
+- `engram cloud enroll <project>` — enroll one project for cloud replication
+- `engram cloud config --server <url>` — persist cloud server URL to `~/.engram/cloud.json`
+- `engram cloud serve` — run cloud backend API + dashboard (`/dashboard`) using Postgres config from env
+
+Cloud auth token is provided at runtime via `ENGRAM_CLOUD_TOKEN` (not by a dedicated CLI subcommand).
+Cloud server startup fails closed when the token is missing unless `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` is explicitly set for local insecure development.
+`ENGRAM_CLOUD_INSECURE_NO_AUTH=1` cannot be combined with `ENGRAM_CLOUD_TOKEN`.
+Cloud server always requires `ENGRAM_CLOUD_ALLOWED_PROJECTS` (comma-separated), including insecure mode, so project scope remains server-enforced.
+`ENGRAM_CLOUD_TOKEN` + `ENGRAM_CLOUD_ALLOWED_PROJECTS` are server-side requirements for authenticated mode and must be configured before `engram cloud serve` (or compose startup).
+Authenticated mode also requires an explicit non-default `ENGRAM_JWT_SECRET`; implicit development defaults are rejected.
+Dashboard requests support browser login in authenticated mode: use `/dashboard/login` to exchange the bearer token for an HttpOnly dashboard cookie scoped to `/dashboard`. Sync API routes (`/sync/pull`, `/sync/push`) remain header-auth only. Insecure mode is intended only for local smoke usage.
+
+Cloud runtime bind host is controlled by `ENGRAM_CLOUD_HOST`:
+- default: `127.0.0.1` (local-only, safer default)
+- container/compose: set `ENGRAM_CLOUD_HOST=0.0.0.0` so published host ports can reach the cloud server
+
+Cloud sync is still local-first and explicit:
+
+```bash
+# Explicit cloud sync call
+engram sync --cloud --project my-project
+
+# Optional env toggle for cloud mode in sync command
+ENGRAM_CLOUD_SYNC=1 engram sync --status --project my-project
+```
+
+### Local Cloud Bring-Up (Docker + Postgres)
+
+```bash
+# 1) SERVER-SIDE startup requirements (configure before startup)
+# docker-compose.cloud.yml includes defaults for browser-demo smoke usage:
+# ENGRAM_CLOUD_INSECURE_NO_AUTH=1
+# ENGRAM_CLOUD_ALLOWED_PROJECTS=smoke-project
+docker compose -f docker-compose.cloud.yml up -d
+
+# source-run flow (without compose): set BOTH token + allowlist before startup
+# ENGRAM_DATABASE_URL="postgres://engram:engram_dev@127.0.0.1:5433/engram_cloud?sslmode=disable" \
+# ENGRAM_JWT_SECRET="replace-with-32+-byte-random-secret" \
+# ENGRAM_CLOUD_TOKEN="your-token" \
+# ENGRAM_CLOUD_ALLOWED_PROJECTS="my-project" \
+# engram cloud serve
+
+# 2) CLIENT-SIDE CLI setup
+# compose runtime flow: published :18080
+engram cloud config --server http://127.0.0.1:18080
+# compose runtime default is insecure local-dev mode; keep token unset
+# client sync preflight only requires the configured cloud server URL; no
+# client-side ENGRAM_CLOUD_INSECURE_NO_AUTH flag is required for compose flow
+unset ENGRAM_CLOUD_TOKEN
+
+# 3) Enroll project + run explicit cloud sync
+engram cloud enroll smoke-project
+engram sync --cloud --status --project smoke-project
+
+# source-run client endpoint (without compose): default :8080
+# engram cloud config --server http://127.0.0.1:8080
+
+# cloud mode enforces a single explicit project scope
+# engram sync --cloud --all  # blocked by design
+```
+
+Deterministic reason codes shared across store/CLI/server:
+
+- `blocked_unenrolled`
+- `auth_required`
+- `cloud_config_error`
+- `policy_forbidden`
+- `paused`
+- `transport_failed`
+
+### Cloud Status Visibility Matrix
+
+Cloud failure visibility must stay deterministic across supported surfaces:
+
+| Scenario | Expected deterministic reason | Surfaces |
+|---|---|---|
+| Unconfigured cloud sync preflight (missing server URL) | `cloud_config_error` | CLI stderr |
+| Cloud runtime not configured in status provider (takes precedence even if project scope is unresolved) | `cloud_not_configured` | `/sync/status` |
+| `/sync/status` project cannot be resolved (no query/default project) while cloud runtime is configured | `project_required` | `/sync/status` |
+| Unenrolled project cloud sync | `blocked_unenrolled` | CLI stderr + `/sync/status` |
+| Runtime auth/policy failure from remote API | `auth_required` / `policy_forbidden` | CLI stderr + `/sync/status` |
+| Explicit paused state | `paused` | `/sync/status` |
+| Remote/network failure | `transport_failed` | CLI stderr + `/sync/status` |
+
+`engram sync --cloud --status --project <name>` is read-only: it does **not** mutate `/sync/status` lifecycle fields.
 
 ---
 
@@ -372,7 +491,8 @@ Share memories through git repositories using compressed chunks with a manifest 
 - `engram sync` — Exports new memories as a gzipped JSONL chunk to `.engram/chunks/`
 - `engram sync --all` — Exports ALL memories from every project
 - `engram sync --import` — Imports chunks listed in the manifest that haven't been imported yet
-- `engram sync --status` — Shows how many chunks exist locally vs remotely
+- `engram sync --status` — Shows how many chunks exist locally vs remotely (filesystem mode)
+- `engram sync --cloud --status --project <name>` — Shows local, remote, and pending chunk counts for the specified cloud project
 - `engram sync --project NAME` — Filters export to a specific project
 
 ```

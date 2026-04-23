@@ -4,6 +4,13 @@
 
 Engram works with **any MCP-compatible agent**. Pick your agent below.
 
+> Cloud bootstrap automation in agent scripts/plugins is intentionally deferred in this rollout. Use `engram cloud ...` manually for now.
+>
+> Deferred validation scope for this rollout:
+> - Setup/plugin scripts are **not** yet validated as cloud enrollment/login orchestrators.
+> - `engram setup ...` installs MCP/plugin integrations only; it does **not** auto-run `engram cloud config/enroll`.
+> - Cloud onboarding contract remains CLI-first until script-level cloud flows are explicitly implemented.
+
 ## Quick Reference
 
 | Agent | One-liner | Manual Config |
@@ -32,19 +39,19 @@ engram setup opencode
 
 This does two things:
 1. Copies the plugin to `~/.config/opencode/plugins/engram.ts` (session tracking, Memory Protocol, compaction recovery)
-2. Adds the `engram` MCP server entry to your `opencode.json` (the 13 memory tools)
+2. Adds the `engram` MCP server entry to your `opencode.json` with `--tools=agent` (11 agent-facing tools)
 
-The plugin also needs the HTTP server running for session tracking:
+The plugin auto-starts the HTTP server if needed for session tracking. If your environment blocks background processes, run it manually:
 
 ```bash
 engram serve &
 ```
 
-> **Windows**: On Windows, `engram setup opencode` writes to `%APPDATA%\opencode\plugins\` and `%APPDATA%\opencode\opencode.json` automatically. To run the server in the background: `Start-Process engram -ArgumentList "serve" -WindowStyle Hidden` (PowerShell) or just run `engram serve` in a separate terminal.
+> **Windows**: OpenCode uses `~/.config/opencode/` on Windows too (it does not read `%APPDATA%\opencode\`). `engram setup opencode` writes to `~/.config/opencode/plugins/` and `~/.config/opencode/opencode.json`. To run the server in the background: `Start-Process engram -ArgumentList "serve" -WindowStyle Hidden` (PowerShell) or just run `engram serve` in a separate terminal.
 
-**Alternative: Manual MCP-only setup** (no plugin, just the 13 memory tools):
+**Alternative: Manual MCP-only setup** (no plugin, all 15 tools by default):
 
-Add to your `opencode.json` (global: `~/.config/opencode/opencode.json` or project-level; on Windows: `%APPDATA%\opencode\opencode.json`):
+Add to your `opencode.json` (global: `~/.config/opencode/opencode.json` on all platforms, or project-level):
 
 ```json
 {
@@ -83,7 +90,7 @@ engram setup claude-code
 
 During setup, you'll be asked whether to add engram tools to `~/.claude/settings.json` permissions allowlist — this prevents Claude Code from prompting for confirmation on every memory operation.
 
-**Option C: Bare MCP** — just the 13 memory tools, no session management:
+**Option C: Bare MCP** — all 15 tools by default, no session management:
 
 Add to your `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
 

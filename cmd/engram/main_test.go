@@ -164,6 +164,15 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
+	if !strings.Contains(stdout, "cloud <subcommand>") {
+		t.Fatalf("usage missing cloud command tree: %q", stdout)
+	}
+	if !strings.Contains(stdout, "serve      Run cloud backend + dashboard") {
+		t.Fatalf("usage missing cloud serve command: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Required for cloud serve in BOTH token auth and insecure no-auth mode") {
+		t.Fatalf("usage missing updated ENGRAM_CLOUD_ALLOWED_PROJECTS contract: %q", stdout)
+	}
 }
 
 func TestPrintPostInstall(t *testing.T) {
@@ -582,6 +591,9 @@ func TestMainExitPaths(t *testing.T) {
 	}{
 		{name: "no args", helperCase: "no-args", expectedOutput: "Usage:", expectedExitOne: true},
 		{name: "unknown command", helperCase: "unknown", expectedOutput: "Usage:", expectedStderr: "unknown command:", expectedExitOne: true},
+		{name: "cloud missing subcommand", helperCase: "cloud-missing", expectedOutput: "usage: engram cloud", expectedExitOne: true},
+		{name: "cloud unknown subcommand", helperCase: "cloud-unknown", expectedOutput: "supported subcommands", expectedStderr: "unknown cloud command", expectedExitOne: true},
+		{name: "cloud enroll missing project", helperCase: "cloud-enroll-missing", expectedOutput: "usage: engram cloud enroll <project>", expectedExitOne: true},
 	}
 
 	for _, tc := range tests {
@@ -623,6 +635,12 @@ func TestMainExitHelper(t *testing.T) {
 		os.Args = []string{"engram"}
 	case "unknown":
 		os.Args = []string{"engram", "definitely-unknown-command"}
+	case "cloud-missing":
+		os.Args = []string{"engram", "cloud"}
+	case "cloud-unknown":
+		os.Args = []string{"engram", "cloud", "nope"}
+	case "cloud-enroll-missing":
+		os.Args = []string{"engram", "cloud", "enroll"}
 	default:
 		os.Args = []string{"engram", "--help"}
 	}

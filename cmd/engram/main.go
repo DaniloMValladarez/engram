@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -26,6 +27,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/autosync"
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
+	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
 	"github.com/Gentleman-Programming/engram/internal/project"
@@ -97,6 +101,10 @@ var (
 	syncExport = func(sy *engramsync.Syncer, createdBy, project string) (*engramsync.SyncResult, error) {
 		return sy.Export(createdBy, project)
 	}
+	newCloudAutosyncManager = func(s *store.Store, _ any) cloudAutosyncManager {
+		mgr := autosync.New(s, nil, autosync.DefaultConfig())
+		return autosyncManagerAdapter{manager: mgr}
+	}
 
 	exitFunc = os.Exit
 
@@ -109,6 +117,303 @@ var (
 	// newObsidianWatcher is injectable for testing.
 	newObsidianWatcher = obsidian.NewWatcher
 )
+
+type cloudSyncStatus struct {
+	Phase               string
+	LastError           string
+	ConsecutiveFailures int
+	BackoffUntil        *time.Time
+	LastSyncAt          *time.Time
+	ReasonCode          string
+	ReasonMessage       string
+}
+
+type cloudAutosyncManager interface {
+	Run(context.Context)
+	NotifyDirty()
+	Status() cloudSyncStatus
+}
+
+type autosyncManagerAdapter struct {
+	manager *autosync.Manager
+}
+
+func (a autosyncManagerAdapter) Run(ctx context.Context) {
+	a.manager.Run(ctx)
+}
+
+func (a autosyncManagerAdapter) NotifyDirty() {
+	a.manager.NotifyDirty()
+}
+
+func (a autosyncManagerAdapter) Status() cloudSyncStatus {
+	status := a.manager.Status()
+	return cloudSyncStatus{
+		Phase:               status.Phase,
+		LastError:           status.LastError,
+		ConsecutiveFailures: status.ConsecutiveFailures,
+		BackoffUntil:        status.BackoffUntil,
+		LastSyncAt:          status.LastSyncAt,
+		ReasonCode:          status.ReasonCode,
+		ReasonMessage:       status.ReasonMessage,
+	}
+}
+
+type storeSyncStatusProvider struct {
+	store          *store.Store
+	defaultProject string
+	cfg            store.Config
+}
+
+func (p storeSyncStatusProvider) Status(project string) server.SyncStatus {
+	resolvedProject, _ := store.NormalizeProject(project)
+	resolvedProject = strings.TrimSpace(resolvedProject)
+	if resolvedProject == "" {
+		resolvedProject, _ = store.NormalizeProject(p.defaultProject)
+		resolvedProject = strings.TrimSpace(resolvedProject)
+	}
+	enabled, disabledCode, disabledMessage := p.cloudSyncEnabled(resolvedProject)
+	targetKey := cloudTargetKeyForProject(resolvedProject)
+	if !enabled {
+		if disabledCode == "cloud_not_configured" && resolvedProject != "" {
+			enrolled, err := p.store.IsProjectEnrolled(resolvedProject)
+			if err != nil {
+				return server.SyncStatus{
+					Enabled:       false,
+					Phase:         store.SyncLifecycleIdle,
+					ReasonCode:    "status_unavailable",
+					ReasonMessage: fmt.Sprintf("cloud enrollment status is unavailable: %v", err),
+				}
+			}
+			if !enrolled {
+				return server.SyncStatus{
+					Enabled:       false,
+					Phase:         store.SyncLifecycleIdle,
+					ReasonCode:    constants.ReasonBlockedUnenrolled,
+					ReasonMessage: fmt.Sprintf("project %q is not enrolled for cloud sync", resolvedProject),
+				}
+			}
+			state, err := p.store.GetSyncState(targetKey)
+			if err == nil && hasMeaningfulSyncState(state) {
+				status := syncStatusFromState(state)
+				status.Enabled = true
+				return status
+			}
+		}
+		return server.SyncStatus{
+			Enabled:       false,
+			Phase:         store.SyncLifecycleIdle,
+			ReasonCode:    disabledCode,
+			ReasonMessage: disabledMessage,
+		}
+	}
+	state, err := p.store.GetSyncState(targetKey)
+	if err != nil {
+		reason := "sync state is unavailable"
+		lastErr := fmt.Sprintf("read sync state: %v", err)
+		return server.SyncStatus{
+			Enabled:       true,
+			Phase:         store.SyncLifecycleDegraded,
+			ReasonCode:    "status_unavailable",
+			ReasonMessage: reason,
+			LastError:     lastErr,
+		}
+	}
+	status := syncStatusFromState(state)
+	status.Enabled = true
+	return status
+}
+
+func (p storeSyncStatusProvider) cloudSyncEnabled(project string) (bool, string, string) {
+	cc, err := resolveCloudRuntimeConfig(p.cfg)
+	if err != nil {
+		return false, "cloud_config_error", fmt.Sprintf("cloud config error: %v", err)
+	}
+	if cc == nil || strings.TrimSpace(cc.ServerURL) == "" {
+		return false, "cloud_not_configured", "cloud sync is not configured"
+	}
+	if _, err := validateCloudServerURL(cc.ServerURL); err != nil {
+		return false, "cloud_config_error", fmt.Sprintf("cloud config error: invalid cloud runtime server URL: %v", err)
+	}
+	if strings.TrimSpace(project) == "" {
+		return false, "project_required", "cloud sync status requires an explicit project scope"
+	}
+	enrolled, err := p.store.IsProjectEnrolled(project)
+	if err != nil {
+		return false, "status_unavailable", fmt.Sprintf("cloud enrollment status is unavailable: %v", err)
+	}
+	if !enrolled {
+		return false, constants.ReasonBlockedUnenrolled, fmt.Sprintf("project %q is not enrolled for cloud sync", project)
+	}
+	return true, "", ""
+}
+
+func syncStatusFromState(state *store.SyncState) server.SyncStatus {
+	var lastSyncAt *time.Time
+	if state != nil && state.Lifecycle == store.SyncLifecycleHealthy {
+		lastSyncAt = parseSyncStateTimestamp(state.UpdatedAt)
+	}
+	return server.SyncStatus{
+		Phase:               state.Lifecycle,
+		LastError:           derefString(state.LastError),
+		ConsecutiveFailures: state.ConsecutiveFailures,
+		BackoffUntil:        parseRFC3339Ptr(state.BackoffUntil),
+		LastSyncAt:          lastSyncAt,
+		ReasonCode:          derefString(state.ReasonCode),
+		ReasonMessage:       derefString(state.ReasonMessage),
+	}
+}
+
+func hasMeaningfulSyncState(state *store.SyncState) bool {
+	if state == nil {
+		return false
+	}
+	if state.Lifecycle != "" && state.Lifecycle != store.SyncLifecycleIdle {
+		return true
+	}
+	if state.LastEnqueuedSeq > 0 || state.LastAckedSeq > 0 || state.LastPulledSeq > 0 {
+		return true
+	}
+	if state.ConsecutiveFailures > 0 {
+		return true
+	}
+	if state.BackoffUntil != nil || state.LeaseOwner != nil || state.LeaseUntil != nil {
+		return true
+	}
+	if state.ReasonCode != nil || state.ReasonMessage != nil || state.LastError != nil {
+		return true
+	}
+	return false
+}
+
+func parseSyncStateTimestamp(value string) *time.Time {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return &parsed
+	}
+	if parsed, err := time.ParseInLocation("2006-01-02 15:04:05", trimmed, time.UTC); err == nil {
+		return &parsed
+	}
+	return nil
+}
+
+func parseRFC3339Ptr(value *string) *time.Time {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339, *value)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func derefString(ptr *string) string {
+	if ptr == nil {
+		return ""
+	}
+	return *ptr
+}
+
+func envBool(key string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func resolveCloudRuntimeConfig(cfg store.Config) (*cloudConfig, error) {
+	cc, err := loadCloudConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("read cloud config: %w", err)
+	}
+	if cc == nil {
+		cc = &cloudConfig{}
+	}
+	// Legacy persisted tokens in cloud.json are intentionally ignored at runtime.
+	// Runtime auth must come from ENGRAM_CLOUD_TOKEN.
+	cc.Token = ""
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_SERVER")); v != "" {
+		cc.ServerURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN")); v != "" {
+		cc.Token = v
+	}
+	return cc, nil
+}
+
+func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutateState bool) (*cloudConfig, error) {
+	project = strings.TrimSpace(project)
+	if project != "" {
+		project, _ = store.NormalizeProject(project)
+	}
+	targetKey := cloudTargetKeyForProject(project)
+
+	cc, err := resolveCloudRuntimeConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cloud sync config error: %w", err)
+	}
+	hasServer := strings.TrimSpace(cc.ServerURL) != ""
+	if !hasServer {
+		message := "cloud server is missing: configure server URL with `engram cloud config --server <url>`"
+		if mutateState {
+			_ = s.MarkSyncBlocked(targetKey, constants.ReasonCloudConfigError, message)
+		}
+		return nil, fmt.Errorf("cloud sync %s: %s", constants.ReasonCloudConfigError, message)
+	}
+	if _, err := validateCloudServerURL(cc.ServerURL); err != nil {
+		message := fmt.Sprintf("invalid cloud runtime server URL: %v", err)
+		if mutateState {
+			_ = s.MarkSyncBlocked(targetKey, constants.ReasonCloudConfigError, message)
+		}
+		return nil, fmt.Errorf("cloud sync %s: %s", constants.ReasonCloudConfigError, message)
+	}
+	if project != "" {
+		enrolled, err := s.IsProjectEnrolled(project)
+		if err != nil {
+			return nil, fmt.Errorf("cloud sync enrollment check: %w", err)
+		}
+		if !enrolled {
+			message := fmt.Sprintf("project %q is not enrolled for cloud sync", project)
+			if mutateState {
+				_ = s.MarkSyncBlocked(targetKey, constants.ReasonBlockedUnenrolled, message)
+			}
+			return nil, fmt.Errorf("cloud sync blocked_unenrolled: %s", message)
+		}
+	}
+	return cc, nil
+}
+
+func cloudTargetKeyForProject(project string) string {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return constants.TargetKeyCloud
+	}
+	project, _ = store.NormalizeProject(project)
+	if strings.TrimSpace(project) == "" {
+		return constants.TargetKeyCloud
+	}
+	return fmt.Sprintf("%s:%s", constants.TargetKeyCloud, project)
+}
+
+func markCloudSyncFailure(s *store.Store, targetKey string, syncErr error) {
+	if syncErr == nil {
+		return
+	}
+	var statusErr *remote.HTTPStatusError
+	if errors.As(syncErr, &statusErr) {
+		switch {
+		case statusErr.IsAuthFailure():
+			_ = s.MarkSyncAuthRequired(targetKey, syncErr.Error())
+			return
+		case statusErr.IsPolicyFailure():
+			_ = s.MarkSyncBlocked(targetKey, constants.ReasonPolicyForbidden, syncErr.Error())
+			return
+		}
+	}
+	_ = s.MarkSyncFailure(targetKey, syncErr.Error(), time.Now().UTC().Add(30*time.Second))
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -167,6 +472,8 @@ func main() {
 		cmdImport(cfg)
 	case "sync":
 		cmdSync(cfg)
+	case "cloud":
+		cmdCloud(cfg)
 	case "obsidian-export":
 		cmdObsidianExport(cfg)
 	case "projects":
@@ -207,6 +514,12 @@ func cmdServe(cfg store.Config) {
 	defer s.Close()
 
 	srv := newHTTPServer(s, port)
+	srv.SetSyncStatus(storeSyncStatusProvider{store: s, defaultProject: resolveServeSyncStatusProject(), cfg: cfg})
+
+	if envBool("ENGRAM_CLOUD_AUTOSYNC") {
+		fatal(fmt.Errorf("cloud autosync is not available in this release; use explicit cloud sync commands"))
+		return
+	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
@@ -220,6 +533,17 @@ func cmdServe(cfg store.Config) {
 	if err := startHTTP(srv); err != nil {
 		fatal(err)
 	}
+}
+
+func resolveServeSyncStatusProject() string {
+	projectName := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
+	if projectName == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			projectName = detectProject(cwd)
+		}
+	}
+	projectName, _ = store.NormalizeProject(projectName)
+	return strings.TrimSpace(projectName)
 }
 
 func cmdMCP(cfg store.Config) {
@@ -635,7 +959,9 @@ func cmdSync(cfg store.Config) {
 	doImport := false
 	doStatus := false
 	doAll := false
+	doCloud := false
 	project := ""
+	projectProvided := false
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--import":
@@ -644,9 +970,12 @@ func cmdSync(cfg store.Config) {
 			doStatus = true
 		case "--all":
 			doAll = true
+		case "--cloud":
+			doCloud = true
 		case "--project":
 			if i+1 < len(os.Args) {
 				project = os.Args[i+1]
+				projectProvided = true
 				i++
 			}
 		}
@@ -660,6 +989,13 @@ func cmdSync(cfg store.Config) {
 			project = detectProject(cwd)
 		}
 	}
+	if project != "" {
+		normalizedProject, warning := store.NormalizeProject(project)
+		project = normalizedProject
+		if warning != "" {
+			fmt.Fprintln(os.Stderr, warning)
+		}
+	}
 
 	syncDir := ".engram"
 
@@ -669,12 +1005,80 @@ func cmdSync(cfg store.Config) {
 	}
 	defer s.Close()
 
-	sy := engramsync.NewLocal(s, syncDir)
+	cloudEnabled := doCloud || envBool("ENGRAM_CLOUD_SYNC")
+	if cloudEnabled {
+		if doAll {
+			fatal(fmt.Errorf("cloud sync requires a single explicit --project scope; --all is not supported"))
+		}
+		if !projectProvided || strings.TrimSpace(project) == "" {
+			fatal(fmt.Errorf("cloud sync requires an explicit non-empty --project value"))
+		}
+	}
+	cloudTargetKey := cloudTargetKeyForProject(project)
+	var sy *engramsync.Syncer
+
+	markCloudHealthy := func() {
+		if !cloudEnabled {
+			return
+		}
+		if err := s.MarkSyncHealthy(cloudTargetKey); err != nil {
+			fatal(fmt.Errorf("cloud sync health update: %w", err))
+		}
+	}
+
+	markCloudSyncOutcome := func() {
+		if !cloudEnabled {
+			return
+		}
+		hasPending, err := s.HasPendingSyncMutationsForProject(project)
+		if err != nil {
+			fatal(fmt.Errorf("cloud sync state update: %w", err))
+		}
+		pendingImports := 0
+		remoteStatusVerified := false
+		if _, _, pending, statusErr := syncStatus(sy); statusErr == nil {
+			pendingImports = pending
+			remoteStatusVerified = true
+		}
+		if hasPending || (remoteStatusVerified && pendingImports > 0) {
+			if err := s.MarkSyncPending(cloudTargetKey); err != nil {
+				fatal(fmt.Errorf("cloud sync pending-state update: %w", err))
+			}
+			return
+		}
+		if !remoteStatusVerified {
+			return
+		}
+		markCloudHealthy()
+	}
+
+	sy = engramsync.NewLocal(s, syncDir)
+	if cloudEnabled {
+		cc, err := preflightCloudSync(s, cfg, project, !doStatus)
+		if err != nil {
+			fatal(err)
+		}
+		transport, err := remote.NewRemoteTransport(cc.ServerURL, cc.Token, project)
+		if err != nil {
+			if !doStatus {
+				markCloudSyncFailure(s, cloudTargetKey, err)
+			}
+			fatal(err)
+		}
+		sy = engramsync.NewCloudWithTransport(s, transport, project)
+	}
 
 	if doStatus {
 		local, remote, pending, err := syncStatus(sy)
 		if err != nil {
 			fatal(err)
+		}
+		if cloudEnabled {
+			fmt.Printf("Cloud sync status (project=%q):\n", project)
+			fmt.Printf("  Local chunks:    %d\n", local)
+			fmt.Printf("  Remote chunks:   %d\n", remote)
+			fmt.Printf("  Pending import:  %d\n", pending)
+			return
 		}
 		fmt.Printf("Sync status:\n")
 		fmt.Printf("  Local chunks:    %d\n", local)
@@ -686,8 +1090,12 @@ func cmdSync(cfg store.Config) {
 	if doImport {
 		result, err := syncImport(sy)
 		if err != nil {
+			if cloudEnabled {
+				markCloudSyncFailure(s, cloudTargetKey, err)
+			}
 			fatal(err)
 		}
+		markCloudSyncOutcome()
 
 		if result.ChunksImported == 0 {
 			fmt.Println("No new chunks to import.")
@@ -697,7 +1105,11 @@ func cmdSync(cfg store.Config) {
 			return
 		}
 
-		fmt.Printf("Imported %d new chunk(s) from .engram/\n", result.ChunksImported)
+		if cloudEnabled {
+			fmt.Printf("Imported %d new remote chunk(s) for project %q\n", result.ChunksImported, project)
+		} else {
+			fmt.Printf("Imported %d new chunk(s) from .engram/\n", result.ChunksImported)
+		}
 		fmt.Printf("  Sessions:     %d\n", result.SessionsImported)
 		fmt.Printf("  Observations: %d\n", result.ObservationsImported)
 		fmt.Printf("  Prompts:      %d\n", result.PromptsImported)
@@ -712,12 +1124,20 @@ func cmdSync(cfg store.Config) {
 	if doAll {
 		fmt.Println("Exporting ALL memories (all projects)...")
 	} else {
-		fmt.Printf("Exporting memories for project %q...\n", project)
+		if cloudEnabled {
+			fmt.Printf("Exporting memories for project %q to cloud...\n", project)
+		} else {
+			fmt.Printf("Exporting memories for project %q...\n", project)
+		}
 	}
 	result, err := syncExport(sy, username, project)
 	if err != nil {
+		if cloudEnabled {
+			markCloudSyncFailure(s, cloudTargetKey, err)
+		}
 		fatal(err)
 	}
+	markCloudSyncOutcome()
 
 	if result.IsEmpty {
 		if doAll {
@@ -732,6 +1152,13 @@ func cmdSync(cfg store.Config) {
 	fmt.Printf("  Sessions:     %d\n", result.SessionsExported)
 	fmt.Printf("  Observations: %d\n", result.ObservationsExported)
 	fmt.Printf("  Prompts:      %d\n", result.PromptsExported)
+	if result.MutationsExported > 0 {
+		fmt.Printf("  Mutations:    %d\n", result.MutationsExported)
+	}
+	if cloudEnabled {
+		fmt.Printf("Cloud sync complete for project %q.\n", project)
+		return
+	}
 	fmt.Println()
 	fmt.Println("Add to git:")
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
@@ -1550,10 +1977,16 @@ Commands:
                        --dry-run  Preview what would be merged (no changes)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
-                       --import   Import new chunks from .engram/ into local DB
-                       --status   Show sync status (local vs remote chunks)
-                       --project  Filter export to a specific project
-                       --all      Export ALL projects (ignore directory-based filter)
+                         --import   Import new chunks from .engram/ into local DB
+                         --status   Show sync status
+                         --project  Filter export to a specific project
+                         --all      Export ALL projects (ignore directory-based filter)
+		                 --cloud    Run sync against configured cloud endpoint (requires explicit --project)
+	  cloud <subcommand> Cloud integration commands (opt-in)
+	                        status     Show cloud config status
+	                        enroll     Enroll a project for cloud sync
+	                        config     Set cloud server URL
+	                        serve      Run cloud backend + dashboard
   obsidian-export    Export memories to an Obsidian-compatible markdown vault
                        --vault         Path to Obsidian vault root (required)
                        --project       Filter export to a single project (optional)
@@ -1571,6 +2004,11 @@ Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
   ENGRAM_PROJECT     Override auto-detected project name for MCP server
+  ENGRAM_CLOUD_ALLOWED_PROJECTS
+	                     Comma-separated project allowlist enforced by cloud server
+	                     Required for cloud serve in BOTH token auth and insecure no-auth mode
+	ENGRAM_JWT_SECRET   Required in authenticated cloud serve mode (ENGRAM_CLOUD_TOKEN set);
+	                     must be explicitly set to a non-default value
 
 MCP Configuration (add to your agent's config):
   {

@@ -98,6 +98,8 @@ engram tui
 
 Share memories across machines. Uses compressed chunks — no merge conflicts, no huge files.
 
+Local SQLite remains the source of truth. Cloud integration is opt-in replication.
+
 ```bash
 engram sync                    # Export new memories as compressed chunk
 git add .engram/ && git commit -m "sync engram memories"
@@ -106,6 +108,81 @@ engram sync --status           # Check sync status
 ```
 
 Full sync documentation → [DOCS.md](DOCS.md)
+
+## Cloud Integration (Opt-In Replication)
+
+Cloud is optional. Local SQLite stays authoritative; cloud is replication/shared access only.
+
+```bash
+# 1) SERVER-SIDE runtime config (must be set BEFORE server startup)
+# Option A (docker compose runtime): defaults are included in docker-compose.cloud.yml
+# - ENGRAM_CLOUD_INSECURE_NO_AUTH=1 (browser/dashboard local demo mode)
+# - ENGRAM_CLOUD_ALLOWED_PROJECTS=smoke-project
+docker compose -f docker-compose.cloud.yml up -d
+
+# Option B (source-run runtime): set both token + allowlist before `engram cloud serve`
+ENGRAM_DATABASE_URL="postgres://engram:engram_dev@127.0.0.1:5433/engram_cloud?sslmode=disable" \
+ENGRAM_JWT_SECRET="replace-with-32+-byte-random-secret" \
+ENGRAM_CLOUD_TOKEN="your-token" \
+ENGRAM_CLOUD_ALLOWED_PROJECTS="my-project" \
+engram cloud serve
+
+# For local insecure development only (disables bearer auth, but still enforces project allowlist):
+# ENGRAM_CLOUD_INSECURE_NO_AUTH=1 ENGRAM_CLOUD_ALLOWED_PROJECTS="my-project" engram cloud serve
+
+# 2) CLIENT-SIDE config for CLI sync calls
+# Set cloud endpoint (writes ~/.engram/cloud.json)
+# Option A (docker compose runtime): published :18080
+engram cloud config --server http://127.0.0.1:18080
+
+# Option B (source-run runtime): default :8080
+# engram cloud config --server http://127.0.0.1:8080
+
+# 3) Client auth config (env var; CLI does not persist token for you)
+# compose default runs insecure local demo mode, so keep token unset:
+# client sync preflight only requires the configured cloud server URL,
+# so no client-side ENGRAM_CLOUD_INSECURE_NO_AUTH flag is required here.
+# (if remote server enforces bearer auth, set ENGRAM_CLOUD_TOKEN)
+unset ENGRAM_CLOUD_TOKEN
+# source-run authenticated flow: use the same token value passed to `engram cloud serve`
+# export ENGRAM_CLOUD_TOKEN="your-token"
+
+# 4) Enroll an explicit project
+engram cloud enroll smoke-project
+
+# 5) Run cloud sync explicitly
+engram sync --cloud --project smoke-project
+engram sync --cloud --status --project smoke-project
+
+# Note: cloud mode requires a single explicit --project scope.
+# `engram sync --cloud --all` is intentionally blocked.
+```
+
+Deterministic failure reasons are surfaced across CLI and server (`/sync/status`):
+
+- `blocked_unenrolled`
+- `auth_required`
+- `cloud_config_error`
+- `policy_forbidden`
+- `paused`
+- `transport_failed`
+
+Cloud preflight/config errors (for example missing or invalid configured server URL) surface as `cloud_config_error`.
+
+Dashboard access note: compose smoke defaults to insecure local-dev mode (`ENGRAM_CLOUD_INSECURE_NO_AUTH=1`) so browser access to `/dashboard` works without extra auth. In authenticated mode, browser users can open `/dashboard/login`, paste the bearer token once, and continue with an HttpOnly dashboard session cookie.
+
+Runtime toggles:
+
+- `ENGRAM_CLOUD_SYNC=1` enables cloud transport for `engram sync`
+- `ENGRAM_CLOUD_SERVER` overrides configured server URL at runtime
+- `ENGRAM_CLOUD_TOKEN` provides auth token at runtime for authenticated client sync/server auth mode
+- `ENGRAM_CLOUD_ALLOWED_PROJECTS` is server-side only and must be set before `engram cloud serve` (or in compose env)
+- `ENGRAM_JWT_SECRET` must be explicitly set to a non-default value in authenticated cloud server mode (`ENGRAM_CLOUD_TOKEN` set)
+
+Cloud runtime bind host:
+
+- `ENGRAM_CLOUD_HOST` controls `engram cloud serve` bind host (default `127.0.0.1` for local safety)
+- For containerized runtime/compose publishing, set `ENGRAM_CLOUD_HOST=0.0.0.0`
 
 ## CLI Reference
 
@@ -123,6 +200,7 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram export [file]` | Export to JSON |
 | `engram import <file>` | Import from JSON |
 | `engram sync` | Git sync export/import |
+| `engram cloud <subcommand>` | Opt-in cloud config/status/enrollment + cloud runtime (`serve`) |
 | `engram projects list\|consolidate\|prune` | Manage project names |
 | `engram obsidian-export` | Export to Obsidian vault (beta) |
 | `engram version` | Show version |
