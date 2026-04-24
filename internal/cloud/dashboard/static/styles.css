@@ -267,7 +267,7 @@ button:hover,
 button.outline.secondary:hover {
 	border-color: rgba(196, 167, 231, 0.7);
 	background: linear-gradient(180deg, rgba(196, 167, 231, 0.85), rgba(31, 29, 46, 0.95));
-	color: var(--engram-base);
+	color: var(--engram-text);
 }
 
 .shell-nav {
