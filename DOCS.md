@@ -46,6 +46,8 @@ For other docs:
 - **user_prompts** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `content`, `project`, `created_at`
 - **prompts_fts** — FTS5 virtual table synced via triggers (`content`, `project`)
 - **sync_chunks** — `target_key` (TEXT), `chunk_id` (TEXT), `imported_at`; composite PK (`target_key`, `chunk_id`) for target-scoped chunk tracking
+- **memory_relations** — stores conflict-surfacing verdicts from `mem_judge`; columns include `sync_id` (TEXT PK), `source_id`, `target_id`, `relation`, `judgment_status` (`pending` | `judged`), `reason`, `evidence`, `confidence`, `marked_by_actor`, `marked_by_kind`, `marked_by_model`, `session_id`, `project`. Syncs across machines via cloud autosync when the project is enrolled.
+- **sync_apply_deferred** — holds pulled mutations that could not be applied locally due to a missing FK dependency (e.g. relation references an observation not yet present); columns: `sync_id` (TEXT PK), `entity`, `payload`, `apply_status` (`deferred` | `applied` | `dead`), `retry_count`, `last_error`, `last_attempted_at`, `first_seen_at`. Rows with `apply_status='dead'` have exceeded the retry cap (5 attempts) and will not be retried automatically.
 
 ### SQLite Configuration
 
@@ -119,7 +121,7 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
   - `200` when deleted
   - `404` when session does not exist
   - `409` when session still has observations (delete/migrate observations first)
-  - `409` when the session's project is enrolled for cloud sync (session deletion is blocked to avoid local/cloud divergence)
+  - For cloud-enrolled projects: returns `200` and additionally enqueues a `session/delete` mutation that propagates the deletion to cloud replicas
 
 ### Observations
 
@@ -185,6 +187,8 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
   - `last_sync_at`
   - `reason_code`
   - `reason_message`
+  - `deferred_count` — number of pulled mutations awaiting retry (FK dependency not yet local)
+  - `dead_count` — number of pulled mutations that exhausted retries (5 failures) and will not be retried
   - `upgrade` (nested object)
     - `stage`
     - `reason_code`
@@ -393,6 +397,19 @@ Returns success even when cwd is ambiguous — empty `project` + non-empty `avai
 
 Search persistent memory across all sessions. Supports FTS5 full-text search with type/project/scope/limit filters.
 
+When an observation has judged relations in `memory_relations`, the result entry includes annotation lines immediately after the title/content block:
+
+```
+supersedes: #<id> (<title>)       — this memory supersedes another
+superseded_by: #<id> (<title>)    — another memory supersedes this one
+conflicts: #<id> (<title>)        — judged conflict with another memory
+conflict: contested by #<id> (pending)  — pending (not yet judged)
+```
+
+Multiple annotation lines appear when multiple relations apply — one per related observation. Titles are retrieved via JOIN (no N+1 queries). When the related observation has been deleted, `(deleted)` replaces the title. Agent parsers should match by prefix — these prefixes are stable across versions (REQ-012).
+
+Pending relations (from `mem_save` conflict surfacing, before `mem_judge` is called) produce the `conflict: contested by #<id> (pending)` form. Judged relations produce the enriched form with title.
+
 ### mem_save
 
 Save structured observations. The tool description teaches agents the format:
@@ -483,7 +500,7 @@ Parameters:
 
 Re-judging an existing relation overwrites it (deliberate revision). Two agents judging the same pair persist as separate rows — Phase 1 surfaces both; cross-actor reconciliation is Phase 2.
 
-Search results subsequently expose annotation lines like `supersedes: #<id>` and `superseded_by: #<id>` so the recalling agent sees relevant verdicts at-a-glance. The structured `supersedes[]`, `superseded_by[]`, and `conflicts[]` fields are also attached per result.
+Search results subsequently expose annotation lines like `supersedes: #<id> (<title>)`, `superseded_by: #<id> (<title>)`, and `conflicts: #<id> (<title>)` so the recalling agent sees relevant verdicts at-a-glance. For enrolled projects with autosync enabled, judgments propagate to other machines via the cloud mutation pipeline — the annotation appears in `mem_search` results on any machine that has pulled the relevant mutations.
 
 ---
 

@@ -161,12 +161,32 @@ After a verdict is recorded, `mem_search` annotations surface as follows:
 
 | Relation verdict | Annotation in `mem_search` results |
 |-----------------|-----------------------------------|
-| `supersedes` | `supersedes: #<id>` on the source observation; `superseded_by: #<id>` on the target |
+| `supersedes` | `supersedes: #<id> (<title>)` on the source observation; `superseded_by: #<id> (<title>)` on the target |
+| `supersedes` (target deleted) | `supersedes: #<id> (deleted)` — falls back to `(deleted)` when the related observation is missing |
+| `conflicts_with` (judged) | `conflicts: #<id> (<title>)` on both observations — one line per conflict |
 | `pending` (not yet judged) | `conflict: contested by #<id> (pending)` on both observations |
-| `conflicts_with` | No annotation line. Judgment is stored in `memory_relations` but not surfaced in search results in Phase 1. |
-| `compatible`, `related`, `scoped`, `not_conflict` | No annotation line. Judgment is stored but not surfaced in Phase 1. |
+| `compatible`, `related`, `scoped`, `not_conflict` | No annotation line. Judgment is stored but not surfaced. |
 
-> **Known gap**: `conflicts_with` judgments are persisted and queryable in `memory_relations` but do not produce a visible annotation in `mem_search` output. Only `supersedes` and `pending` relations produce annotation lines. This is by design for Phase 1 — a `conflicts_with` annotation format is not yet defined.
+### Annotation format contract (REQ-012)
+
+The annotation format is a stable, versioned contract. Agent parsers use prefix-based matching — these prefixes will not change in Phase 3:
+
+```
+supersedes: #<id> (<title>)
+superseded_by: #<id> (<title>)
+conflicts: #<id> (<title>)
+conflict: contested by #<id> (pending)
+```
+
+Multiple entries appear on separate lines (one per related observation), in query-return order. The `<title>` is retrieved via JOIN at search time (no N+1 queries). When the related observation has been deleted, `(deleted)` replaces the title.
+
+> **Parser note**: match by prefix (`supersedes:`, `superseded_by:`, `conflicts:`, `conflict:`). The format `#<integer-id> (<title>)` within parentheses is stable. Do not attempt to parse the title itself — it may contain any characters.
+
+### Cloud sync for judgments
+
+When a project is enrolled in Engram Cloud and autosync is enabled, `mem_judge` verdicts sync across machines. The `memory_relations` table propagates via the standard mutation push/pull cycle — the same pipeline used for observations and sessions. Judgments appear in `mem_search` annotations on any machine that has pulled the relevant mutations.
+
+Relations where the referenced observation does not yet exist locally are deferred (see `sync_apply_deferred`) and retried automatically on subsequent pull cycles.
 
 ### mem_save envelope fields (conflict surfacing)
 

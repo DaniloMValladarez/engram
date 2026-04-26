@@ -443,8 +443,11 @@ There is no separate dashboard or conflict list in Phase 1.
 
 Once the agent calls `mem_judge` with a verdict:
 - The relation row is persisted with `judgment_status: "judged"` and the chosen `relation`.
-- If the relation is `supersedes`, future `mem_search` results will show `supersedes:` / `superseded_by:` annotations for the affected observations.
-- If the relation is `conflicts_with`, `compatible`, `related`, `scoped`, or `not_conflict`, the judgment is stored in `memory_relations` but no annotation appears in search results (Phase 1 scope).
+- If the relation is `supersedes`, future `mem_search` results show `supersedes: #<id> (<title>)` and `superseded_by: #<id> (<title>)` annotations on the affected observations, including the related memory's title.
+- If the relation is `conflicts_with`, future `mem_search` results show `conflicts: #<id> (<title>)` on both observations.
+- If the relation is `compatible`, `related`, `scoped`, or `not_conflict`, the judgment is stored in `memory_relations` but no annotation appears in search results.
+
+**Cloud sync**: when the project is enrolled in Engram Cloud and autosync is enabled, `mem_judge` verdicts propagate to other machines via the standard mutation push/pull cycle. The annotation appears in `mem_search` results on any machine that has pulled the relevant mutations. Relations that reference an observation not yet present locally are deferred and retried automatically on subsequent pull cycles — the verdict is never lost.
 
 Nothing breaks if `mem_judge` is never called — pending relations accumulate unjudged but do not affect other operations.
 
