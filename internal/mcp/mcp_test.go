@@ -72,6 +72,23 @@ func assertSessionSyncMutationDirectory(t *testing.T, s *store.Store, sessionID,
 	t.Fatalf("expected pending session upsert sync mutation for %q; got %#v", sessionID, mutations)
 }
 
+func countPromptUpsertSyncMutations(t *testing.T, s *store.Store) int {
+	t.Helper()
+
+	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending sync mutations: %v", err)
+	}
+
+	count := 0
+	for _, mutation := range mutations {
+		if mutation.Entity == store.SyncEntityPrompt && mutation.Op == store.SyncOpUpsert {
+			count++
+		}
+	}
+	return count
+}
+
 func TestNewServerRegistersTools(t *testing.T) {
 	s := newMCPTestStore(t)
 	srv := NewServer(s)
@@ -141,6 +158,9 @@ func TestHandleSaveSuggestsTopicKeyWhenMissing(t *testing.T) {
 
 func TestHandleSaveAutoCapturesCurrentPromptByDefault(t *testing.T) {
 	s := newMCPTestStore(t)
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
 	activity := NewSessionActivity(10 * time.Minute)
 	sessionID := defaultSessionID("engram")
 	activity.RecordPrompt(sessionID, "engram", "please persist the auth decision")
@@ -184,6 +204,88 @@ func TestHandleSaveAutoCapturesCurrentPromptByDefault(t *testing.T) {
 	}
 	if len(prompts) != 1 {
 		t.Fatalf("expected prompt dedupe to keep one row, got %d: %#v", len(prompts), prompts)
+	}
+	if got := countPromptUpsertSyncMutations(t, s); got != 1 {
+		t.Fatalf("expected prompt dedupe to keep one prompt sync mutation, got %d", got)
+	}
+}
+
+func TestHandleSaveRecordsActivityForExplicitSessionID(t *testing.T) {
+	s := newMCPTestStore(t)
+	activity := NewSessionActivity(10 * time.Minute)
+	h := handleSave(s, MCPConfig{}, activity)
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":      "Explicit session save",
+		"content":    "**What**: saved with explicit session\n**Why**: regression test",
+		"type":       "bugfix",
+		"project":    "engram",
+		"session_id": "custom-session-123",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	if got := activity.ActivityScore("custom-session-123"); !strings.Contains(got, "1 save") {
+		t.Fatalf("expected explicit session activity to record save, got %q", got)
+	}
+	if got := activity.ActivityScore(defaultSessionID("engram")); got != "" {
+		t.Fatalf("expected default session activity to remain untouched, got %q", got)
+	}
+}
+
+func TestHandleSaveWithNilActivityStillSucceeds(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, nil)
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Nil activity save",
+		"content": "**What**: saved without activity tracker\n**Why**: regression test",
+		"type":    "bugfix",
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+}
+
+func TestHandleSavePromptCaptureFailureIsNonFatal(t *testing.T) {
+	s := newMCPTestStore(t)
+	activity := NewSessionActivity(10 * time.Minute)
+	activity.RecordPrompt(defaultSessionID("engram"), "engram", "prompt capture should fail non-fatally")
+	h := handleSave(s, MCPConfig{}, activity)
+
+	originalAddPromptIfMissing := addPromptIfMissing
+	addPromptIfMissing = func(*store.Store, store.AddPromptParams) (int64, bool, error) {
+		return 0, false, errors.New("forced prompt capture failure")
+	}
+	t.Cleanup(func() { addPromptIfMissing = originalAddPromptIfMissing })
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Non fatal prompt capture",
+		"content": "**What**: saved despite prompt capture failure\n**Why**: regression test",
+		"type":    "bugfix",
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Title != "Non fatal prompt capture" {
+		t.Fatalf("expected observation to be saved despite prompt capture failure, got %#v", obs)
 	}
 }
 

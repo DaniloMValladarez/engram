@@ -53,6 +53,10 @@ type MCPConfig struct {
 
 var suggestTopicKey = store.SuggestTopicKey
 
+var addPromptIfMissing = func(s *store.Store, params store.AddPromptParams) (int64, bool, error) {
+	return s.AddPromptIfMissing(params)
+}
+
 var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
 }
@@ -1077,7 +1081,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 
 		if capturePrompt && activity != nil {
 			if prompt, ok := activity.CurrentPrompt(sessionID, project); ok {
-				if _, _, promptErr := s.AddPromptIfMissing(store.AddPromptParams{
+				if _, _, promptErr := addPromptIfMissing(s, store.AddPromptParams{
 					SessionID: sessionID,
 					Content:   prompt,
 					Project:   project,
@@ -1087,7 +1091,9 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 			}
 		}
 
-		activity.RecordSave(defaultSessionID(project))
+		if activity != nil {
+			activity.RecordSave(sessionID)
+		}
 
 		msg := fmt.Sprintf("Memory saved: %q (%s)", title, typ)
 		if topicKey == "" && suggestedTopicKey != "" {
