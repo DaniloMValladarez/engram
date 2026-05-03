@@ -605,6 +605,7 @@ Save structured observations. The tool description teaches agents the format:
 - **type**: `decision` | `architecture` | `bugfix` | `pattern` | `config` | `discovery` | `learning`
 - **scope**: `project` (default) | `personal`
 - **topic_key**: optional canonical topic id (e.g. `architecture/auth-model`) used to upsert evolving memories
+- **capture_prompt**: optional boolean, default `true`; when current prompt context is available for the same project/session, Engram records it alongside the observation. Automated pipeline saves such as SDD artifacts should pass `false`.
 - **content**: Structured with `**What**`, `**Why**`, `**Where**`, `**Learned**`
 
 Exact duplicate saves are deduplicated in a rolling time window using a normalized content hash + project + scope + type + title.
@@ -625,6 +626,7 @@ Delete an observation by ID. Uses soft-delete by default (`deleted_at`); optiona
 ### mem_save_prompt
 
 Save user prompts — records what the user asked so future sessions have context about user goals.
+When called in the same MCP process, this also feeds the current prompt context used by later `mem_save` calls with `capture_prompt=true`.
 
 ### mem_context
 

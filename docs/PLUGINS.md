@@ -256,6 +256,12 @@ When `mem_save` detects candidates, the JSON response includes:
 
 Old clients that read only the `result` string continue to work — these fields are additive.
 
+### mem_save prompt capture
+
+`mem_save` accepts `capture_prompt` as an optional boolean. The default is `true`: if the MCP process already has the current user prompt for the same project and session, Engram stores it in `user_prompts` using exact project + session + content dedupe. Passing `capture_prompt=false` skips that prompt capture path and is intended for automated artifacts such as SDD progress saves.
+
+If no current prompt is available to the MCP process, `mem_save` still succeeds and no prompt is invented from the observation content. Plugins/protocol hooks that can observe user prompts must feed that prompt context before relying on automatic capture. Calling `mem_save_prompt` in the same MCP process records the prompt and makes it available to later `mem_save` calls for the same project/session.
+
 ---
 
 ## Admin Observability (conflict layer)

@@ -53,7 +53,7 @@ Next session starts → Previous session context is injected automatically
 
 | Tool | Purpose |
 |------|---------|
-| `mem_save` | Save a structured observation (decision, bugfix, pattern, etc.) |
+| `mem_save` | Save a structured observation (decision, bugfix, pattern, etc.); automatically captures the current prompt when one is available unless `capture_prompt=false` |
 | `mem_update` | Update an existing observation by ID |
 | `mem_delete` | Delete an observation (soft-delete by default, hard-delete optional) |
 | `mem_suggest_topic_key` | Suggest a stable `topic_key` for evolving topics before saving |
@@ -88,6 +88,7 @@ Token-efficient memory retrieval — don't dump everything, drill in:
 
 - `mem_save` now supports `scope` (`project` default, `personal` optional)
 - `mem_save` also supports `topic_key`; with a topic key, saves become upserts (same project+scope+topic updates the existing memory)
+- `mem_save` supports `capture_prompt` (`true` by default). When the MCP process has current prompt context for the same project and session, it records that prompt alongside the observation. Automated saves such as SDD artifacts should pass `capture_prompt=false`.
 - Exact dedupe prevents repeated inserts in a rolling window (hash + project + scope + type + title)
 - Duplicates update metadata (`duplicate_count`, `last_seen_at`, `updated_at`) instead of creating new rows
 - Topic upserts increment `revision_count` so evolving decisions stay in one memory

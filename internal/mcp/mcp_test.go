@@ -139,6 +139,150 @@ func TestHandleSaveSuggestsTopicKeyWhenMissing(t *testing.T) {
 	}
 }
 
+func TestHandleSaveAutoCapturesCurrentPromptByDefault(t *testing.T) {
+	s := newMCPTestStore(t)
+	activity := NewSessionActivity(10 * time.Minute)
+	sessionID := defaultSessionID("engram")
+	activity.RecordPrompt(sessionID, "engram", "please persist the auth decision")
+	h := handleSave(s, MCPConfig{}, activity)
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Auth decision",
+		"content": "**What**: chose auth boundary\n**Why**: user asked",
+		"type":    "decision",
+		"project": "engram",
+	}}}
+
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	prompts, err := s.RecentPrompts("engram", 5)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("expected one auto-captured prompt, got %d: %#v", len(prompts), prompts)
+	}
+	if prompts[0].SessionID != sessionID || prompts[0].Content != "please persist the auth decision" {
+		t.Fatalf("unexpected prompt row: %#v", prompts[0])
+	}
+
+	// Saving another observation in the same session should reuse the prompt row,
+	// not duplicate exact same project+session+content context.
+	res, err = h(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("second save failed: err=%v isError=%v text=%q", err, res.IsError, callResultText(t, res))
+	}
+	prompts, err = s.RecentPrompts("engram", 5)
+	if err != nil {
+		t.Fatalf("recent prompts after second save: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("expected prompt dedupe to keep one row, got %d: %#v", len(prompts), prompts)
+	}
+}
+
+func TestHandleSavePromptFeedsAutoCaptureContext(t *testing.T) {
+	s := newMCPTestStore(t)
+	activity := NewSessionActivity(10 * time.Minute)
+	savePrompt := handleSavePrompt(s, MCPConfig{}, activity)
+	save := handleSave(s, MCPConfig{}, activity)
+
+	promptRes, err := savePrompt(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"content": "user asked for prompt-linked bugfix memory",
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("save prompt handler error: %v", err)
+	}
+	if promptRes.IsError {
+		t.Fatalf("unexpected save prompt error: %s", callResultText(t, promptRes))
+	}
+
+	saveRes, err := save(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Prompt linked bugfix",
+		"content": "**What**: linked prompt context\n**Why**: user asked",
+		"type":    "bugfix",
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("save handler error: %v", err)
+	}
+	if saveRes.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, saveRes))
+	}
+
+	prompts, err := s.RecentPrompts("engram", 5)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("expected mem_save_prompt row to feed auto-capture without duplicate, got %d: %#v", len(prompts), prompts)
+	}
+	if prompts[0].Content != "user asked for prompt-linked bugfix memory" {
+		t.Fatalf("unexpected prompt content: %#v", prompts[0])
+	}
+}
+
+func TestHandleSaveCapturePromptFalseSkipsCurrentPrompt(t *testing.T) {
+	s := newMCPTestStore(t)
+	activity := NewSessionActivity(10 * time.Minute)
+	activity.RecordPrompt(defaultSessionID("engram"), "engram", "do not capture this prompt")
+	h := handleSave(s, MCPConfig{}, activity)
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":          "SDD artifact",
+		"content":        "## Apply progress",
+		"type":           "architecture",
+		"project":        "engram",
+		"capture_prompt": false,
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	prompts, err := s.RecentPrompts("engram", 5)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected opt-out to skip prompt capture, got %#v", prompts)
+	}
+}
+
+func TestHandleSaveNoCurrentPromptStillSucceeds(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "No prompt available",
+		"content": "**What**: saved without prompt context",
+		"type":    "discovery",
+		"project": "engram",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+	prompts, err := s.RecentPrompts("engram", 5)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected no prompt rows when no current prompt is available, got %#v", prompts)
+	}
+}
+
 func TestHandleSaveDoesNotSuggestWhenTopicKeyProvided(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
@@ -412,7 +556,7 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 		t.Fatalf("add observation: %v", err)
 	}
 
-	savePrompt := handleSavePrompt(s, MCPConfig{})
+	savePrompt := handleSavePrompt(s, MCPConfig{}, nil)
 	savePromptReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content": "how do we fix auth race conditions?",
 		"project": "engram",
@@ -626,7 +770,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected delete to return tool error when store is closed")
 	}
 
-	promptRes, err := handleSavePrompt(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"content": "prompt", "project": "engram"}}})
+	promptRes, err := handleSavePrompt(s, MCPConfig{}, nil)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"content": "prompt", "project": "engram"}}})
 	if err != nil {
 		t.Fatalf("closed store save prompt call: %v", err)
 	}
@@ -1896,7 +2040,7 @@ func TestHandleSaveCreatesProjectScopedSession(t *testing.T) {
 
 func TestHandleSavePromptCreatesProjectScopedSession(t *testing.T) {
 	s := newMCPTestStore(t)
-	h := handleSavePrompt(s, MCPConfig{})
+	h := handleSavePrompt(s, MCPConfig{}, nil)
 
 	// Set up a git repo so auto-detect returns a known project.
 	dir := t.TempDir()
@@ -3130,7 +3274,7 @@ func TestMemSavePrompt_AmbiguousWithValidUserChoiceSucceeds(t *testing.T) {
 	t.Chdir(parent)
 
 	s := newMCPTestStore(t)
-	h := handleSavePrompt(s, MCPConfig{})
+	h := handleSavePrompt(s, MCPConfig{}, nil)
 	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content":               "prompt after user chose repo-prompt-a",
 		"project":               "repo-prompt-a",
@@ -3164,7 +3308,7 @@ func TestMemSavePrompt_AmbiguousWithInventedProjectRejected(t *testing.T) {
 	t.Chdir(parent)
 
 	s := newMCPTestStore(t)
-	h := handleSavePrompt(s, MCPConfig{})
+	h := handleSavePrompt(s, MCPConfig{}, nil)
 	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content":               "prompt must not save",
 		"project":               "invented-prompt-project",
@@ -3611,7 +3755,7 @@ func TestHandleSaveAndPromptUseConfigProjectForWrites(t *testing.T) {
 		t.Fatalf("expected mem_save config envelope, got %v", body)
 	}
 
-	prompt := handleSavePrompt(s, MCPConfig{})
+	prompt := handleSavePrompt(s, MCPConfig{}, nil)
 	res, err = prompt(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content": "prompt saved under config project",
 		"project": "attempted-override", "project_choice_reason": project.SourceUserSelectedAfterAmbiguousProject,
@@ -3929,6 +4073,20 @@ func TestMemSessionSummary_SchemaNoProjectField(t *testing.T) {
 	props := st.Tool.InputSchema.Properties
 	if _, hasProject := props["project"]; hasProject {
 		t.Error("mem_session_summary must not have 'project' in schema (write tool — auto-detect only)")
+	}
+}
+
+func TestMemSaveSchemaIncludesCapturePrompt(t *testing.T) {
+	s := newMCPTestStore(t)
+	srv := NewServer(s)
+
+	st := srv.GetTool("mem_save")
+	if st == nil {
+		t.Fatal("mem_save not registered")
+	}
+	props := st.Tool.InputSchema.Properties
+	if _, ok := props["capture_prompt"]; !ok {
+		t.Fatal("mem_save schema must include capture_prompt")
 	}
 }
 

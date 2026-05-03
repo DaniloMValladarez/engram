@@ -335,6 +335,9 @@ Examples:
 				mcp.WithString("project_choice_reason",
 					mcp.Description("Must be user_selected_after_ambiguous_project, and only after the user explicitly chose one of available_projects from an ambiguous_project error."),
 				),
+				mcp.WithBoolean("capture_prompt",
+					mcp.Description("Automatically capture the current user prompt when available (default: true). Set false for SDD artifacts or automated saves."),
+				),
 			),
 			queuedWriteHandler(writeQueue, handleSave(s, cfg, activity)),
 		)
@@ -447,7 +450,7 @@ Examples:
 					mcp.Description("Must be user_selected_after_ambiguous_project, and only after the user explicitly chose one of available_projects from an ambiguous_project error."),
 				),
 			),
-			queuedWriteHandler(writeQueue, handleSavePrompt(s, cfg)),
+			queuedWriteHandler(writeQueue, handleSavePrompt(s, cfg, activity)),
 		)
 	}
 
@@ -1011,6 +1014,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		topicKey, _ := req.GetArguments()["topic_key"].(string)
 		projectChoice, _ := req.GetArguments()["project"].(string)
 		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
+		capturePrompt := boolArg(req, "capture_prompt", true)
 
 		// Auto-detect project from cwd; only allow explicit user-selected recovery
 		// after ErrAmbiguousProject (issue #306).
@@ -1069,6 +1073,18 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		})
 		if err != nil {
 			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		}
+
+		if capturePrompt && activity != nil {
+			if prompt, ok := activity.CurrentPrompt(sessionID, project); ok {
+				if _, _, promptErr := s.AddPromptIfMissing(store.AddPromptParams{
+					SessionID: sessionID,
+					Content:   prompt,
+					Project:   project,
+				}); promptErr != nil {
+					fmt.Fprintf(os.Stderr, "engram: auto prompt capture error (non-fatal): %v\n", promptErr)
+				}
+			}
 		}
 
 		activity.RecordSave(defaultSessionID(project))
@@ -1243,7 +1259,7 @@ func handleDelete(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
@@ -1270,6 +1286,10 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 		})
 		if err != nil {
 			return mcp.NewToolResultError("Failed to save prompt: " + err.Error()), nil
+		}
+
+		if activity != nil {
+			activity.RecordPrompt(sessionID, project, content)
 		}
 
 		detRes.Project = project
