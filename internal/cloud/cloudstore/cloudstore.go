@@ -547,14 +547,42 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS sessions_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS observations_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS prompts_count INTEGER NOT NULL DEFAULT 0`,
-		`UPDATE cloud_chunks SET created_at = imported_at WHERE imported_at IS NOT NULL AND created_at IS NULL`,
-		`UPDATE cloud_chunks SET sessions_count = sessions WHERE sessions_count = 0 AND sessions IS NOT NULL`,
-		`UPDATE cloud_chunks SET observations_count = memories WHERE observations_count = 0 AND memories IS NOT NULL`,
-		`UPDATE cloud_chunks SET prompts_count = prompts WHERE prompts_count = 0 AND prompts IS NOT NULL`,
 		`DO $$ BEGIN
 			IF EXISTS (
 				SELECT 1 FROM information_schema.columns
-				WHERE table_name = 'cloud_chunks' AND column_name = 'user_id'
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'imported_at'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET created_at = imported_at WHERE imported_at IS NOT NULL AND created_at IS NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'sessions'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET sessions_count = sessions WHERE sessions_count = 0 AND sessions IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'memories'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET observations_count = memories WHERE observations_count = 0 AND memories IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'prompts'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET prompts_count = prompts WHERE prompts_count = 0 AND prompts IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'user_id'
 			) THEN
 				ALTER TABLE cloud_chunks ALTER COLUMN user_id DROP NOT NULL;
 			END IF;
@@ -592,7 +620,8 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 		`DO $$ BEGIN
 			IF EXISTS (
 				SELECT 1 FROM information_schema.columns
-				WHERE table_name = 'cloud_project_controls'
+				WHERE table_schema = current_schema()
+				  AND table_name = 'cloud_project_controls'
 				  AND column_name = 'updated_by'
 				  AND udt_name = 'uuid'
 			) THEN
@@ -617,7 +646,7 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 		`DO $$ BEGIN
 			IF EXISTS (
 				SELECT 1 FROM information_schema.columns
-				WHERE table_name = 'cloud_mutations' AND column_name = 'user_id'
+				WHERE table_schema = current_schema() AND table_name = 'cloud_mutations' AND column_name = 'user_id'
 			) THEN
 				ALTER TABLE cloud_mutations ALTER COLUMN user_id DROP NOT NULL;
 			END IF;
@@ -678,6 +707,7 @@ type MutationChunkBackfillReport struct {
 	Applied             bool   `json:"applied"`
 	CandidateMutations  int    `json:"candidate_mutations"`
 	AlreadyMaterialized int    `json:"already_materialized"`
+	InvalidMutations    int    `json:"invalid_mutations"`
 	ChunksPlanned       int    `json:"chunks_planned"`
 	ChunksInserted      int    `json:"chunks_inserted"`
 }
@@ -796,7 +826,8 @@ func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string
 		report.CandidateMutations++
 		sig, err := mutationEntrySignature(entry)
 		if err != nil {
-			return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: sign mutation chunk backfill candidate %s/%s/%s: %w", entry.Project, entry.Entity, entry.EntityKey, err)
+			report.InvalidMutations++
+			continue
 		}
 		if _, ok := materialized[sig]; ok {
 			report.AlreadyMaterialized++

@@ -2,8 +2,11 @@ package cloudstore
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -40,6 +43,57 @@ func TestChunkIDFromPayloadStable(t *testing.T) {
 	if got := chunkIDFromPayload(payload); got == "" || len(got) != 8 {
 		t.Fatalf("expected 8-char chunk id, got %q", got)
 	}
+}
+
+func TestMigrateAcceptsModernCloudChunksWithoutLegacyColumns(t *testing.T) {
+	dsn := os.Getenv("CLOUDSTORE_TEST_DSN")
+	if dsn == "" {
+		t.Skip("CLOUDSTORE_TEST_DSN not set — skipping integration test (requires Postgres)")
+	}
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		t.Skip("test requires URL-style CLOUDSTORE_TEST_DSN so a per-test search_path can be attached")
+	}
+
+	schema := fmt.Sprintf("cloudstore_modern_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	testDSN := dsn + "?search_path=" + schema
+	if strings.Contains(dsn, "?") {
+		testDSN = dsn + "&search_path=" + schema
+	}
+	db, err := sql.Open("pgx", testDSN)
+	if err != nil {
+		t.Fatalf("open schema db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `CREATE TABLE cloud_chunks (
+		project_name TEXT NOT NULL DEFAULT 'default',
+		chunk_id TEXT NOT NULL,
+		created_by TEXT NOT NULL,
+		client_created_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		payload JSONB NOT NULL,
+		sessions_count INTEGER NOT NULL DEFAULT 0,
+		observations_count INTEGER NOT NULL DEFAULT 0,
+		prompts_count INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		db.Close()
+		t.Fatalf("create modern cloud_chunks: %v", err)
+	}
+	db.Close()
+
+	cs, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("New should migrate modern cloud_chunks without imported_at/sessions/memories/prompts: %v", err)
+	}
+	cs.Close()
 }
 
 func TestMaterializedMutationBatchChunkIncludesObservationAlongsidePromptAndSession(t *testing.T) {
@@ -509,6 +563,38 @@ func TestBackfillMutationChunksIsIdempotent(t *testing.T) {
 	}
 	if got := countCloudChunksForProject(t, cs, project); got != 1 {
 		t.Fatalf("expected no duplicate chunks after rerun, got %d", got)
+	}
+}
+
+func TestBackfillMutationChunksSkipsInvalidLegacyMutationPayloads(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill-invalid")
+	cleanupCloudstoreProject(t, cs, project)
+
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntitySession, "manual-save-engram", store.SyncOpUpsert, `{"id":"manual-save-engram"}`)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-valid", store.SyncOpUpsert, `{"sync_id":"obs-valid","session_id":"sess-valid","type":"decision","title":"Valid observation","content":"materialize this one","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	report, err := cs.BackfillMutationChunks(ctx, project, true)
+	if err != nil {
+		t.Fatalf("BackfillMutationChunks must skip invalid legacy payloads instead of failing: %v", err)
+	}
+	if !report.Applied || report.CandidateMutations != 2 || report.InvalidMutations != 1 || report.ChunksPlanned != 1 || report.ChunksInserted != 1 {
+		t.Fatalf("unexpected report for invalid legacy payload skip: %+v", report)
+	}
+	chunks := readCloudChunksForProject(t, cs, project)
+	if len(chunks) != 1 {
+		t.Fatalf("expected valid mutation to still materialize into one chunk, got %d", len(chunks))
+	}
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(chunks[0], &chunk); err != nil {
+		t.Fatalf("decode repair chunk: %v", err)
+	}
+	if len(chunk.Sessions) != 0 {
+		t.Fatalf("invalid legacy session without directory must not be materialized, got %+v", chunk.Sessions)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-valid" {
+		t.Fatalf("expected valid observation to materialize, got %+v", chunk.Observations)
 	}
 }
 
