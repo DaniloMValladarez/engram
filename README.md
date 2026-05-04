@@ -1,10 +1,10 @@
 <p align="center">
-  <img width="1024" alt="Engram Cloud" src="assets/branding/engram-cloud-logo.png" />
+  <img width="1024" alt="Engram — One Brain. Local or Cloud." src="assets/branding/engram-banner.png" />
 </p>
 
 <p align="center">
   <strong>Persistent memory for AI coding agents</strong><br>
-  <em>Agent-agnostic. Single binary. Zero dependencies.</em>
+  <em>One brain. Local or cloud. Agent-agnostic, single binary, zero dependencies.</em>
 </p>
 
 <p align="center">
