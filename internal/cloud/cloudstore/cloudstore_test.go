@@ -42,6 +42,98 @@ func TestChunkIDFromPayloadStable(t *testing.T) {
 	}
 }
 
+func TestMaterializedMutationBatchChunkIncludesObservationAlongsidePromptAndSession(t *testing.T) {
+	obsPayload := json.RawMessage(`{
+		"sync_id":"obs-04081be99000bdf5",
+		"session_id":"sess-newer",
+		"type":"decision",
+		"title":"newer observation",
+		"content":"must be present in cloud_chunks",
+		"project":"sias-app",
+		"scope":"project",
+		"created_at":"2026-05-04T01:49:52Z"
+	}`)
+	promptPayload := json.RawMessage(`{"sync_id":"prompt-newer","session_id":"sess-newer","content":"newer prompt","project":"sias-app","created_at":"2026-05-04T01:50:00Z"}`)
+	sessionPayload := json.RawMessage(`{"id":"sess-newer","project":"sias-app","directory":"/work/sias-app","started_at":"2026-05-04T01:45:00Z"}`)
+
+	payload, counts, err := materializedMutationBatchChunk([]MutationEntry{
+		{Project: "sias-app", Entity: store.SyncEntitySession, EntityKey: "sess-newer", Op: store.SyncOpUpsert, Payload: sessionPayload},
+		{Project: "sias-app", Entity: store.SyncEntityPrompt, EntityKey: "prompt-newer", Op: store.SyncOpUpsert, Payload: promptPayload},
+		{Project: "sias-app", Entity: store.SyncEntityObservation, EntityKey: "obs-04081be99000bdf5", Op: store.SyncOpUpsert, Payload: obsPayload},
+	})
+	if err != nil {
+		t.Fatalf("materializedMutationBatchChunk: %v", err)
+	}
+	if counts.sessions != 1 || counts.prompts != 1 || counts.observations != 1 {
+		t.Fatalf("expected one session, prompt, and observation in chunk counts, got %+v", counts)
+	}
+
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode materialized chunk: %v", err)
+	}
+	if len(chunk.Prompts) != 1 || len(chunk.Sessions) != 1 {
+		t.Fatalf("expected prompt/session materialized, got sessions=%d prompts=%d", len(chunk.Sessions), len(chunk.Prompts))
+	}
+	if len(chunk.Observations) != 1 {
+		t.Fatalf("expected newer observation mutation to be materialized into payload.observations, got %d", len(chunk.Observations))
+	}
+	if chunk.Observations[0].SyncID != "obs-04081be99000bdf5" {
+		t.Fatalf("expected missing observation sync_id to be present, got %q", chunk.Observations[0].SyncID)
+	}
+	if len(chunk.Mutations) != 3 {
+		t.Fatalf("expected mutation journal payloads retained for replay, got %d", len(chunk.Mutations))
+	}
+}
+
+func TestMaterializedMutationBatchChunksKeepProjectsSeparate(t *testing.T) {
+	chunks, err := materializedMutationBatchChunks([]MutationEntry{
+		{Project: "proj-a", Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpUpsert, Payload: json.RawMessage(`{"sync_id":"prompt-a","session_id":"sess-a","content":"a"}`)},
+		{Project: "proj-b", Entity: store.SyncEntityObservation, EntityKey: "obs-b", Op: store.SyncOpUpsert, Payload: json.RawMessage(`{"sync_id":"obs-b","session_id":"sess-b","type":"decision","title":"b","content":"b","scope":"project"}`)},
+	})
+	if err != nil {
+		t.Fatalf("materializedMutationBatchChunks: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("expected one materialized chunk per project, got %d", len(chunks))
+	}
+	if chunks[0].project != "proj-a" || chunks[1].project != "proj-b" {
+		t.Fatalf("expected project order preserved, got %q then %q", chunks[0].project, chunks[1].project)
+	}
+}
+
+func TestMutationEntrySignatureMatchesCanonicalChunkMutation(t *testing.T) {
+	entry := MutationEntry{
+		Project:   "proj-signature",
+		Entity:    store.SyncEntityObservation,
+		EntityKey: "obs-signature",
+		Op:        store.SyncOpUpsert,
+		Payload:   json.RawMessage(`{"sync_id":"obs-signature","session_id":"sess-signature","type":"decision","title":"Signature","content":"canonical","scope":"project"}`),
+	}
+	entrySig, err := mutationEntrySignature(entry)
+	if err != nil {
+		t.Fatalf("mutationEntrySignature: %v", err)
+	}
+	payload, _, err := materializedMutationBatchChunk([]MutationEntry{entry})
+	if err != nil {
+		t.Fatalf("materializedMutationBatchChunk: %v", err)
+	}
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode materialized chunk: %v", err)
+	}
+	if len(chunk.Mutations) != 1 {
+		t.Fatalf("expected one materialized mutation, got %d", len(chunk.Mutations))
+	}
+	chunkSig, err := syncMutationSignature(chunk.Mutations[0])
+	if err != nil {
+		t.Fatalf("syncMutationSignature: %v", err)
+	}
+	if entrySig != chunkSig {
+		t.Fatalf("expected entry signature to match canonical chunk mutation\nentry=%q\nchunk=%q", entrySig, chunkSig)
+	}
+}
+
 func TestNormalizeJSONCanonicalizesEquivalentPayloads(t *testing.T) {
 	a := []byte(`{"a":1,"b":[2,3]}`)
 	b := []byte("{\n  \"b\": [2,3], \"a\":1\n}")
@@ -344,6 +436,133 @@ func TestWriteChunkMaterializesMutationsAndIsReplayIdempotent(t *testing.T) {
 	if len(mutationsAfterReplay) != 3 {
 		t.Fatalf("expected replay not to duplicate mutations, got %d: %+v", len(mutationsAfterReplay), mutationsAfterReplay)
 	}
+}
+
+func TestBackfillMutationChunksMaterializesExistingMutationRows(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill")
+	cleanupCloudstoreProject(t, cs, project)
+
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntitySession, "sess-backfill", store.SyncOpUpsert, `{"id":"sess-backfill","directory":"/work/backfill","started_at":"2026-05-04T01:45:00Z"}`)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-backfill", store.SyncOpUpsert, `{"sync_id":"obs-backfill","session_id":"sess-backfill","type":"decision","title":"Backfilled observation","content":"must be reconstructed from chunks","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	dryRun, err := cs.BackfillMutationChunks(ctx, project, false)
+	if err != nil {
+		t.Fatalf("BackfillMutationChunks dry-run: %v", err)
+	}
+	if dryRun.Applied || dryRun.CandidateMutations != 2 || dryRun.ChunksPlanned != 1 || dryRun.ChunksInserted != 0 {
+		t.Fatalf("unexpected dry-run report: %+v", dryRun)
+	}
+	if got := countCloudChunksForProject(t, cs, project); got != 0 {
+		t.Fatalf("dry-run must not insert chunks, got %d", got)
+	}
+
+	report, err := cs.BackfillMutationChunks(ctx, project, true)
+	if err != nil {
+		t.Fatalf("BackfillMutationChunks apply: %v", err)
+	}
+	if !report.Applied || report.CandidateMutations != 2 || report.ChunksPlanned != 1 || report.ChunksInserted != 1 {
+		t.Fatalf("unexpected apply report: %+v", report)
+	}
+
+	chunks := readCloudChunksForProject(t, cs, project)
+	if len(chunks) != 1 {
+		t.Fatalf("expected one repair chunk, got %d", len(chunks))
+	}
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(chunks[0], &chunk); err != nil {
+		t.Fatalf("decode repair chunk: %v", err)
+	}
+	if len(chunk.Sessions) != 1 || chunk.Sessions[0].ID != "sess-backfill" {
+		t.Fatalf("expected session upsert in repair chunk, got %+v", chunk.Sessions)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-backfill" {
+		t.Fatalf("expected observation upsert in payload.observations after repair, got %+v", chunk.Observations)
+	}
+	if len(chunk.Mutations) != 2 {
+		t.Fatalf("expected original mutation replay entries retained, got %d", len(chunk.Mutations))
+	}
+}
+
+func TestBackfillMutationChunksIsIdempotent(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill-idempotent")
+	cleanupCloudstoreProject(t, cs, project)
+
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-idempotent", store.SyncOpUpsert, `{"sync_id":"obs-idempotent","session_id":"sess-idempotent","type":"decision","title":"Idempotent observation","content":"materialize once","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	first, err := cs.BackfillMutationChunks(ctx, project, true)
+	if err != nil {
+		t.Fatalf("first BackfillMutationChunks: %v", err)
+	}
+	if first.ChunksInserted != 1 {
+		t.Fatalf("expected first repair to insert one chunk, got %+v", first)
+	}
+	second, err := cs.BackfillMutationChunks(ctx, project, true)
+	if err != nil {
+		t.Fatalf("second BackfillMutationChunks: %v", err)
+	}
+	if second.ChunksPlanned != 0 || second.ChunksInserted != 0 || second.AlreadyMaterialized != 1 {
+		t.Fatalf("expected second repair to be noop, got %+v", second)
+	}
+	if got := countCloudChunksForProject(t, cs, project); got != 1 {
+		t.Fatalf("expected no duplicate chunks after rerun, got %d", got)
+	}
+}
+
+func uniqueCloudstoreTestProject(prefix string) string {
+	return prefix + "-" + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "-")
+}
+
+func cleanupCloudstoreProject(t *testing.T, cs *CloudStore, project string) {
+	t.Helper()
+	t.Cleanup(func() {
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_chunks WHERE project_name = $1`, project)
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_mutations WHERE project = $1`, project)
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_project_sessions WHERE project_name = $1`, project)
+	})
+}
+
+func insertLegacyCloudMutation(t *testing.T, cs *CloudStore, project, entity, entityKey, op, payload string) {
+	t.Helper()
+	_, err := cs.db.ExecContext(context.Background(), `
+		INSERT INTO cloud_mutations (project, entity, entity_key, op, payload)
+		VALUES ($1, $2, $3, $4, $5)`, project, entity, entityKey, op, []byte(payload))
+	if err != nil {
+		t.Fatalf("insert legacy cloud mutation %s/%s: %v", entity, entityKey, err)
+	}
+}
+
+func countCloudChunksForProject(t *testing.T, cs *CloudStore, project string) int {
+	t.Helper()
+	var count int
+	if err := cs.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cloud_chunks WHERE project_name = $1`, project).Scan(&count); err != nil {
+		t.Fatalf("count cloud chunks: %v", err)
+	}
+	return count
+}
+
+func readCloudChunksForProject(t *testing.T, cs *CloudStore, project string) [][]byte {
+	t.Helper()
+	rows, err := cs.db.QueryContext(context.Background(), `SELECT payload FROM cloud_chunks WHERE project_name = $1 ORDER BY created_at ASC, chunk_id ASC`, project)
+	if err != nil {
+		t.Fatalf("query cloud chunks: %v", err)
+	}
+	defer rows.Close()
+	var chunks [][]byte
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatalf("scan cloud chunk: %v", err)
+		}
+		chunks = append(chunks, payload)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate cloud chunks: %v", err)
+	}
+	return chunks
 }
 
 func parseMustChunk(t *testing.T, payload []byte) engramsync.ChunkData {
