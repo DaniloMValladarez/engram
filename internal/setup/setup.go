@@ -369,7 +369,7 @@ func ensurePiMCPConfig(mcpPath string) (bool, error) {
 		"command":     resolveEngramCommand(),
 		"args":        []string{"mcp", "--tools=agent"},
 		"lifecycle":   "lazy",
-		"directTools": true,
+		"directTools": false,
 	}
 	raw, err := jsonMarshalFn(server)
 	if err != nil {
