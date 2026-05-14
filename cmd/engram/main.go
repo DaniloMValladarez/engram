@@ -830,13 +830,27 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 }
 
 func cmdMCP(cfg store.Config) {
-	// Parse --tools flag. Project is always auto-detected from cwd at call time (JR2-4).
 	toolsFilter := ""
+	projectOverride := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
 	for i := 2; i < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--tools=") {
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
 		} else if os.Args[i] == "--tools" && i+1 < len(os.Args) {
 			toolsFilter = os.Args[i+1]
+			i++
+		} else if strings.HasPrefix(os.Args[i], "--project=") {
+			projectOverride = strings.TrimSpace(strings.TrimPrefix(os.Args[i], "--project="))
+			if projectOverride == "" {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
+		} else if os.Args[i] == "--project" {
+			if i+1 >= len(os.Args) {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
+			projectOverride = strings.TrimSpace(os.Args[i+1])
+			if projectOverride == "" {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
 			i++
 		}
 	}
@@ -865,7 +879,7 @@ func cmdMCP(cfg store.Config) {
 	}
 	defer stopAutosync()
 
-	mcpCfg := mcp.MCPConfig{}
+	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride}
 	allowlist := resolveMCPTools(toolsFilter)
 	mcpSrv := newMCPServerWithConfig(s, mcpCfg, allowlist)
 
