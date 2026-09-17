@@ -11329,6 +11329,65 @@ func TestDeleteSession_EnrolledProjectEnqueuesSyncDeleteMutation(t *testing.T) {
 	}
 }
 
+func TestSupersedeUnenrolledLegacyMutationsPreservesTargetKey(t *testing.T) {
+	s := newTestStore(t)
+	const project, key, target = "target_project", "target-prompt", "archive"
+	for _, targetKey := range []string{DefaultSyncTargetKey, target, syncTargetKeyForProject(project)} {
+		if _, err := s.GetSyncState(targetKey); err != nil {
+			t.Fatalf("initialize %q state: %v", targetKey, err)
+		}
+	}
+	if _, err := s.DB().Exec(`INSERT INTO prompt_tombstones (sync_id, session_id, project) VALUES (?, ?, ?)`, key, "target-session", project); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	for _, targetKey := range []string{DefaultSyncTargetKey, target} {
+		if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`, targetKey, SyncEntityPrompt, key, SyncOpUpsert, `{"sync_id":"target-prompt","session_id":"target-session","content":"obsolete","project":"target_project"}`, SyncSourceLocal, project); err != nil {
+			t.Fatalf("seed %q mutation: %v", targetKey, err)
+		}
+	}
+	report, err := s.SupersedeUnenrolledLegacyMutations(target, project, true)
+	if err != nil || len(report.Actions) != 1 {
+		t.Fatalf("supersede report=%+v err=%v", report, err)
+	}
+	for targetKey, want := range map[string]string{target: SyncMutationDispositionSuperseded, DefaultSyncTargetKey: SyncMutationDispositionPending} {
+		var disposition string
+		if err := s.DB().QueryRow(`SELECT disposition FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, targetKey, key).Scan(&disposition); err != nil || disposition != want {
+			t.Fatalf("target %q disposition=%q err=%v, want %q", targetKey, disposition, err, want)
+		}
+	}
+}
+
+func TestSupersedeUnenrolledLegacyMutationsContract(t *testing.T) {
+	s := newTestStore(t)
+	const project, key = "contract_project", "contract-prompt"
+	for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject(project)} {
+		if _, err := s.GetSyncState(targetKey); err != nil {
+			t.Fatalf("initialize %q state: %v", targetKey, err)
+		}
+	}
+	if _, err := s.DB().Exec(`INSERT INTO prompt_tombstones (sync_id, session_id, project) VALUES (?, ?, ?)`, key, "contract-session", project); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`, DefaultSyncTargetKey, SyncEntityPrompt, key, SyncOpUpsert, `{"sync_id":"contract-prompt","session_id":"contract-session","content":"obsolete","project":"contract_project"}`, SyncSourceLocal, project); err != nil {
+		t.Fatalf("seed mutation: %v", err)
+	}
+	dryRun, err := s.SupersedeUnenrolledLegacyMutations(DefaultSyncTargetKey, project, false)
+	if err != nil || len(dryRun.Actions) != 1 {
+		t.Fatalf("dry-run=%+v err=%v", dryRun, err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM prompt_tombstones WHERE sync_id = ?`, key); err != nil {
+		t.Fatalf("remove delete evidence: %v", err)
+	}
+	report, err := s.SupersedeUnenrolledLegacyMutations(DefaultSyncTargetKey, project, true)
+	if err != nil || len(report.Actions) != 0 {
+		t.Fatalf("missing-evidence report=%+v err=%v", report, err)
+	}
+	var disposition string
+	if err := s.DB().QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = ?`, key).Scan(&disposition); err != nil || disposition != SyncMutationDispositionPending {
+		t.Fatalf("disposition=%q err=%v", disposition, err)
+	}
+}
+
 func TestQuarantineIrreparableSyncMutationsPreservesJournalAndUnblocksTransport(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("repairable", "project", "/tmp/repairable"); err != nil {
@@ -12883,6 +12942,146 @@ func TestRepairBackfillsMissingMutations(t *testing.T) {
 	}
 	if promptMutCount == 0 {
 		t.Fatalf("expected prompt mutation to be backfilled, got 0")
+	}
+
+	t.Run("superseded legacy mutation does not satisfy current source state", func(t *testing.T) {
+		const project = "stale_row"
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO sync_state (target_key, lifecycle) VALUES (?, ?)`, DefaultSyncTargetKey, SyncLifecycleIdle); err != nil {
+			t.Fatalf("seed sync state: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "stale-session", project, "/tmp/stale"); err != nil {
+			t.Fatalf("seed stale source: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, 'superseded')`, DefaultSyncTargetKey, SyncEntitySession, "stale-session", SyncOpUpsert, `{"id":"stale-session","project":"stale_row","directory":"/tmp/stale"}`, SyncSourceLocal, project); err != nil {
+			t.Fatalf("seed superseded legacy mutation: %v", err)
+		}
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatalf("re-enroll stale source: %v", err)
+		}
+		var pending int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ? AND entity = ? AND entity_key = ? AND op = ? AND disposition = 'pending'`, project, SyncEntitySession, "stale-session", SyncOpUpsert).Scan(&pending); err != nil {
+			t.Fatalf("count reconstructed mutation: %v", err)
+		}
+		if pending != 1 {
+			t.Fatalf("pending reconstructed mutations = %d, want 1", pending)
+		}
+		var superseded int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ? AND entity = ? AND entity_key = ? AND op = ? AND disposition = 'superseded'`, project, SyncEntitySession, "stale-session", SyncOpUpsert).Scan(&superseded); err != nil {
+			t.Fatalf("count retained terminal evidence: %v", err)
+		}
+		if superseded != 1 {
+			t.Fatalf("retained superseded mutations = %d, want 1", superseded)
+		}
+	})
+
+	t.Run("superseded prompt mutation does not suppress startup backfill", func(t *testing.T) {
+		const project = "stale_prompt"
+		const sessionID = "stale-prompt-session"
+		const promptSyncID = "stale-prompt"
+		if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, sessionID, project, "/tmp/stale-prompt"); err != nil {
+			t.Fatalf("seed prompt session: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`, promptSyncID, sessionID, "current local prompt", project); err != nil {
+			t.Fatalf("seed prompt source: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`, DefaultSyncTargetKey, SyncEntitySession, sessionID, SyncOpUpsert, `{"id":"stale-prompt-session","project":"stale_prompt","directory":"/tmp/stale-prompt"}`, SyncSourceLocal, project); err != nil {
+			t.Fatalf("seed current session mutation: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, 'superseded')`, DefaultSyncTargetKey, SyncEntityPrompt, promptSyncID, SyncOpUpsert, `{"sync_id":"stale-prompt","session_id":"stale-prompt-session","content":"obsolete","project":"stale_prompt"}`, SyncSourceLocal, project); err != nil {
+			t.Fatalf("seed superseded prompt mutation: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES (?)`, project); err != nil {
+			t.Fatalf("seed prompt enrollment: %v", err)
+		}
+		if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+			t.Fatalf("startup repair prompt: %v", err)
+		}
+		var pending int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ? AND entity = ? AND entity_key = ? AND op = ? AND disposition = 'pending'`, project, SyncEntityPrompt, promptSyncID, SyncOpUpsert).Scan(&pending); err != nil {
+			t.Fatalf("count startup-backfilled prompt mutation: %v", err)
+		}
+		if pending != 1 {
+			t.Fatalf("pending startup-backfilled prompt mutations = %d, want 1", pending)
+		}
+	})
+}
+
+func TestRepairBackfillKeepsAcknowledgedCoverage(t *testing.T) {
+	s := newTestStore(t)
+	const project, sessionID = "acknowledged_project", "acknowledged-session"
+	if err := s.EnrollProject(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(sessionID, project, "/tmp/acknowledged"); err != nil {
+		t.Fatal(err)
+	}
+	observationID, err := s.AddObservation(AddObservationParams{SessionID: sessionID, Type: "decision", Title: "acknowledged", Content: "local source", Project: project, Scope: "project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := s.GetObservation(observationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq, before int64
+	if err := s.DB().QueryRow(`SELECT seq FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, observation.SyncID).Scan(&seq); err != nil {
+		t.Fatalf("read observation mutation: %v", err)
+	}
+	if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, []int64{seq}); err != nil {
+		t.Fatalf("ack observation mutation: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatalf("count acknowledged journal: %v", err)
+	}
+	for range 2 {
+		if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+			t.Fatalf("repair acknowledged coverage: %v", err)
+		}
+	}
+	var after, pending int64
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&after); err != nil {
+		t.Fatalf("count repaired journal: %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT SUM(CASE WHEN acked_at IS NULL AND disposition = 'pending' THEN 1 ELSE 0 END) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityObservation, observation.SyncID).Scan(&pending); err != nil {
+		t.Fatalf("read repaired mutation: %v", err)
+	}
+	if after != before || pending != 0 {
+		t.Fatalf("journal before=%d after=%d pending=%d, want no new mutation", before, after, pending)
+	}
+}
+
+func TestRepairBackfillDoesNotRecreateQuarantinedMutation(t *testing.T) {
+	s := newTestStoreRaw(t)
+	const project, sessionID, syncID = "quarantine_project", "quarantine-session", "quarantine-observation"
+	for _, targetKey := range []string{DefaultSyncTargetKey, syncTargetKeyForProject(project)} {
+		if _, err := s.GetSyncState(targetKey); err != nil {
+			t.Fatalf("initialize %q state: %v", targetKey, err)
+		}
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sync_enrolled_projects (project) VALUES (?)`, project); err != nil {
+		t.Fatalf("seed enrollment: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, sessionID, project, "/tmp/quarantine"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, syncID, sessionID, "decision", "", "corrupt source", project, "project", hashNormalized("corrupt source")); err != nil {
+		t.Fatalf("seed corrupt source: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`, DefaultSyncTargetKey, SyncEntitySession, sessionID, SyncOpUpsert, `{"id":"quarantine-session","project":"quarantine_project","directory":"/tmp/quarantine"}`, SyncSourceLocal, project); err != nil {
+		t.Fatalf("seed session coverage: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, 'quarantined')`, DefaultSyncTargetKey, SyncEntityObservation, syncID, SyncOpUpsert, `{"sync_id":"quarantine-observation","session_id":"quarantine-session","type":"decision","title":"","content":"corrupt source","project":"quarantine_project","scope":"project"}`, SyncSourceLocal, project); err != nil {
+		t.Fatalf("seed quarantined coverage: %v", err)
+	}
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	var pending int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND disposition = 'pending'`, SyncEntityObservation, syncID).Scan(&pending); err != nil {
+		t.Fatalf("count recreated mutations: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("recreated pending mutations = %d, want 0", pending)
 	}
 }
 
@@ -15520,6 +15719,106 @@ func TestFormatContextWithOptionsMaxBytes(t *testing.T) {
 			t.Fatalf("expected retained ASCII context before truncation, got %q", got)
 		}
 	})
+}
+
+func TestUnenrolledProjectMutationsDoNotEnqueueForSessionObservationAndPrompt(t *testing.T) {
+	s := newTestStore(t)
+	const project = "unenrolled-guard"
+	if err := s.CreateSession("unenrolled-guard-session", project, "/tmp/unenrolled-guard"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{SessionID: "unenrolled-guard-session", Type: "decision", Title: "local only", Content: "no cloud backlog", Project: project, Scope: "project"}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{SessionID: "unenrolled-guard-session", Content: "local only", Project: project}); err != nil {
+		t.Fatalf("AddPrompt: %v", err)
+	}
+	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, project); got != 0 {
+		t.Fatalf("unenrolled project queued %d mutations, want 0", got)
+	}
+}
+
+func TestUnenrolledDeleteSupersedesPendingLegacyMutations(t *testing.T) {
+	t.Run("session", func(t *testing.T) {
+		s := newTestStore(t)
+		const project = "unenrolled-session"
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateSession("unenrolled-session-id", project, "/tmp/unenrolled-session"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UnenrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteSession("unenrolled-session-id"); err != nil {
+			t.Fatal(err)
+		}
+		assertLegacyMutationSuperseded(t, s, project, SyncEntitySession, "unenrolled-session-id")
+	})
+
+	t.Run("prompt", func(t *testing.T) {
+		s := newTestStore(t)
+		const project = "unenrolled-prompt"
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateSession("unenrolled-prompt-session", project, "/tmp/unenrolled-prompt"); err != nil {
+			t.Fatal(err)
+		}
+		promptID, err := s.AddPrompt(AddPromptParams{SessionID: "unenrolled-prompt-session", Content: "retire pending upsert", Project: project})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var syncID string
+		if err := s.db.QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, promptID).Scan(&syncID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UnenrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeletePrompt(promptID); err != nil {
+			t.Fatal(err)
+		}
+		assertLegacyMutationSuperseded(t, s, project, SyncEntityPrompt, syncID)
+	})
+
+	t.Run("observation", func(t *testing.T) {
+		s := newTestStore(t)
+		const project = "unenrolled-observation"
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateSession("unenrolled-observation-session", project, "/tmp/unenrolled-observation"); err != nil {
+			t.Fatal(err)
+		}
+		observationID, err := s.AddObservation(AddObservationParams{SessionID: "unenrolled-observation-session", Type: "decision", Title: "retire pending upsert", Content: "delete while unenrolled", Project: project, Scope: "project"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var syncID string
+		if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, observationID).Scan(&syncID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UnenrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteObservation(observationID, false); err != nil {
+			t.Fatal(err)
+		}
+		assertLegacyMutationSuperseded(t, s, project, SyncEntityObservation, syncID)
+	})
+}
+
+func assertLegacyMutationSuperseded(t *testing.T, s *Store, project, entity, entityKey string) {
+	t.Helper()
+	var disposition, reason string
+	if err := s.db.QueryRow(`SELECT disposition, ifnull(disposition_reason, '') FROM sync_mutations WHERE project = ? AND entity = ? AND entity_key = ? AND op = ? AND source = ?`, project, entity, entityKey, SyncOpUpsert, SyncSourceLocal).Scan(&disposition, &reason); err != nil {
+		t.Fatalf("read legacy mutation: %v", err)
+	}
+	if disposition != "superseded" || strings.TrimSpace(reason) == "" {
+		t.Fatalf("legacy mutation disposition=%q reason=%q, want auditable superseded disposition", disposition, reason)
+	}
 }
 
 func TestLimitContextBytesUTF8AndSmallBudget(t *testing.T) {

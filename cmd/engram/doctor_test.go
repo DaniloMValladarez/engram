@@ -713,6 +713,18 @@ func TestCmdDoctorRepairQuarantinesInvalidEmptyProjectMutations(t *testing.T) {
 	}
 	seedDoctorPendingMutation(t, cfg, "", store.SyncEntitySession, "poison", store.SyncOpUpsert, `{"id":"poison"}`)
 	seedDoctorPendingMutation(t, cfg, "", store.SyncEntitySession, "later", store.SyncOpDelete, `{"id":"later"}`)
+	seedDoctorPendingMutation(t, cfg, "legacy", store.SyncEntityPrompt, "retired-prompt", store.SyncOpUpsert, `{"sync_id":"retired-prompt","session_id":"legacy-session","content":"obsolete","project":"legacy"}`)
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy tombstone fixture: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO prompt_tombstones (sync_id, session_id, project) VALUES (?, ?, ?)`, "retired-prompt", "legacy-session", "legacy"); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed legacy tombstone fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy tombstone fixture: %v", err)
+	}
 
 	withArgs(t, "engram", "doctor", "repair", "--check", "sync_mutation_required_fields", "--dry-run")
 	dryOut, dryErr := captureOutput(t, func() { cmdDoctor(cfg) })
@@ -720,7 +732,7 @@ func TestCmdDoctorRepairQuarantinesInvalidEmptyProjectMutations(t *testing.T) {
 		t.Fatalf("dry-run stderr=%q", dryErr)
 	}
 	dry := decodeRepairPlan(t, dryOut)
-	if dry["applied"] != false || len(dry["actions"].([]any)) != 2 {
+	if dry["applied"] != false || len(dry["actions"].([]any)) != 2 || len(dry["superseded"].([]any)) != 1 {
 		t.Fatalf("dry-run=%v", dry)
 	}
 
@@ -730,23 +742,73 @@ func TestCmdDoctorRepairQuarantinesInvalidEmptyProjectMutations(t *testing.T) {
 		t.Fatalf("apply stderr=%q", applyErr)
 	}
 	applied := decodeRepairPlan(t, applyOut)
-	if applied["applied"] != true || len(applied["actions"].([]any)) != 2 {
+	if applied["applied"] != true || len(applied["actions"].([]any)) != 2 || len(applied["superseded"].([]any)) != 1 {
 		t.Fatalf("apply=%v", applied)
 	}
-	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	db, err = sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	defer db.Close()
-	var poison, later string
+	var poison, later, retired string
 	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'poison'`).Scan(&poison); err != nil {
 		t.Fatalf("read poison: %v", err)
 	}
 	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'later'`).Scan(&later); err != nil {
 		t.Fatalf("read later: %v", err)
 	}
-	if poison != store.SyncMutationDispositionQuarantined || later != store.SyncMutationDispositionQuarantined {
-		t.Fatalf("dispositions poison=%q later=%q", poison, later)
+	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = 'retired-prompt'`).Scan(&retired); err != nil {
+		t.Fatalf("read retired prompt: %v", err)
+	}
+	if poison != store.SyncMutationDispositionQuarantined || later != store.SyncMutationDispositionQuarantined || retired != "superseded" {
+		t.Fatalf("dispositions poison=%q later=%q retired=%q", poison, later, retired)
+	}
+}
+
+func TestCmdDoctorRepairSupersedesBeforeQuarantine(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+	const project, sessionID = "legacy", "retired-session"
+	seedDoctorPendingMutation(t, cfg, project, store.SyncEntitySession, sessionID, store.SyncOpUpsert, `{}`)
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open tombstone fixture: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sync_delete_tombstones (entity, entity_key, project, active) VALUES (?, ?, ?, 1)`, store.SyncEntitySession, sessionID, project); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close tombstone fixture: %v", err)
+	}
+
+	runRepair := func(mode string) map[string]any {
+		t.Helper()
+		withArgs(t, "engram", "doctor", "repair", "--project", project, "--check", "sync_mutation_required_fields", mode)
+		stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+		if stderr != "" {
+			t.Fatalf("%s stderr=%q", mode, stderr)
+		}
+		return decodeRepairPlan(t, stdout)
+	}
+	for _, mode := range []string{"--dry-run", "--apply"} {
+		report := runRepair(mode)
+		if len(report["actions"].([]any)) != 0 || len(report["superseded"].([]any)) != 1 {
+			t.Fatalf("%s report=%v", mode, report)
+		}
+	}
+	db, err = sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("reopen fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close fixture: %v", err)
+		}
+	})
+	var disposition string
+	if err := db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity_key = ?`, sessionID).Scan(&disposition); err != nil || disposition != store.SyncMutationDispositionSuperseded {
+		t.Fatalf("disposition=%q err=%v", disposition, err)
 	}
 }
 
@@ -911,6 +973,17 @@ func TestCmdDoctorRepairApplyUnblocksDoctorAndKeepsPendingWork(t *testing.T) {
 		if state.Lifecycle != store.SyncLifecyclePending {
 			t.Fatalf("quarantine repair masked pending work for %q: lifecycle=%q", targetKey, state.Lifecycle)
 		}
+	}
+}
+
+func TestPrintDoctorUsageDocumentsOptionalRequiredFieldsProject(t *testing.T) {
+	withArgs(t, "engram", "doctor", "--help")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(testConfig(t)) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "doctor repair [--project PROJECT] --check sync_mutation_required_fields") || !strings.Contains(stdout, "optionally scopes title repair, supersession, quarantine, and source-title repair") || !strings.Contains(stdout, "--project is required for every repair check except sync_mutation_required_fields") {
+		t.Fatalf("usage=%q", stdout)
 	}
 }
 
