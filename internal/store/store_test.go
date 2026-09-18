@@ -51,6 +51,22 @@ func enrollTestProject(t *testing.T, s *Store, project string) {
 	}
 }
 
+type firstNextBlockingScanner struct {
+	rowScanner
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (s *firstNextBlockingScanner) Next() bool {
+	next := s.rowScanner.Next()
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return next
+}
+
 func TestStoreDataDir(t *testing.T) {
 	cfg := mustDefaultConfig(t)
 	cfg.DataDir = t.TempDir()
@@ -62,6 +78,76 @@ func TestStoreDataDir(t *testing.T) {
 
 	if got := s.DataDir(); got != cfg.DataDir {
 		t.Fatalf("data directory = %q, want %q", got, cfg.DataDir)
+	}
+}
+
+// Characterization: the plan holds withReadTx open. modernc.org/sqlite v1.45.0
+// must let ReadOnly override the DSN's immediate mode, so this writer proceeds.
+func TestWithReadTxReadOnlyDoesNotReserveWriterLockDuringRepairPlan(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.DedupeWindow = time.Hour
+
+	planner, err := New(cfg)
+	if err != nil {
+		t.Fatalf("open planner store: %v", err)
+	}
+	t.Cleanup(func() { _ = planner.Close() })
+	writer, err := New(cfg)
+	if err != nil {
+		t.Fatalf("open writer store: %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+
+	if _, err := writer.DB().Exec("PRAGMA busy_timeout = 0"); err != nil {
+		t.Fatalf("disable writer busy timeout: %v", err)
+	}
+	oldBackoffs := sqliteWriteRetryBackoffs
+	sqliteWriteRetryBackoffs = nil
+	t.Cleanup(func() { sqliteWriteRetryBackoffs = oldBackoffs })
+
+	originalQueryIt := planner.hooks.queryIt
+	plannerEnteredQuery := make(chan struct{})
+	releasePlanner := make(chan struct{})
+	var releasePlannerOnce sync.Once
+	release := func() { releasePlannerOnce.Do(func() { close(releasePlanner) }) }
+	t.Cleanup(release)
+	planner.hooks.queryIt = func(db queryer, query string, args ...any) (rowScanner, error) {
+		rows, err := originalQueryIt(db, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		if strings.Contains(query, "FROM sync_mutations WHERE target_key") {
+			return &firstNextBlockingScanner{rowScanner: rows, entered: plannerEnteredQuery, release: releasePlanner}, nil
+		}
+		return rows, nil
+	}
+	t.Cleanup(func() { planner.hooks.queryIt = originalQueryIt })
+
+	plannerDone := make(chan error, 1)
+	go func() {
+		_, err := planner.RepairObservationMutationTitles("project-a", false)
+		plannerDone <- err
+	}()
+
+	select {
+	case <-plannerEnteredQuery:
+	case <-time.After(time.Second):
+		t.Fatal("read-only planner did not reach its query")
+	}
+
+	if err := writer.CreateSession("writer-session", "project-a", "/work/project-a"); err != nil {
+		t.Fatalf("writer blocked by read-only planner: %v", err)
+	}
+
+	release()
+	select {
+	case err := <-plannerDone:
+		if err != nil {
+			t.Fatalf("run read-only planner: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read-only planner did not finish")
 	}
 }
 
@@ -6843,10 +6929,10 @@ func TestSQLiteWriteRetryPersistsAfterIndependentStoreReleasesLock(t *testing.T)
 
 	const lockFailuresBeforeRelease = 5
 	originalExec := writer.hooks.exec
+	originalBeginTx := writer.hooks.beginTx
 	lockFailures := 0
 	var releaseErr error
-	writer.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
-		result, err := originalExec(db, query, args...)
+	recordLockFailure := func(err error) {
 		if isRetryableSQLiteLockError(err) {
 			lockFailures++
 			if lockFailures == lockFailuresBeforeRelease {
@@ -6854,9 +6940,21 @@ func TestSQLiteWriteRetryPersistsAfterIndependentStoreReleasesLock(t *testing.T)
 				locked = false
 			}
 		}
+	}
+	writer.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
+		result, err := originalExec(db, query, args...)
+		recordLockFailure(err)
 		return result, err
 	}
-	t.Cleanup(func() { writer.hooks.exec = originalExec })
+	writer.hooks.beginTx = func(db *sql.DB) (*sql.Tx, error) {
+		tx, err := originalBeginTx(db)
+		recordLockFailure(err)
+		return tx, err
+	}
+	t.Cleanup(func() {
+		writer.hooks.exec = originalExec
+		writer.hooks.beginTx = originalBeginTx
+	})
 
 	id, err := writer.AddObservation(AddObservationParams{
 		SessionID: "retry-lock-session",
@@ -12205,7 +12303,27 @@ func TestRepairObservationMutationTitles(t *testing.T) {
 		}
 	})
 
-	t.Run("reports only actions from the successful retry attempt", func(t *testing.T) {
+	t.Run("planning does not commit", func(t *testing.T) {
+		s, _, _, _ := seed(t, "Recovered title. More detail.", func(map[string]json.RawMessage) {})
+
+		originalCommit := s.hooks.commit
+		commitAttempts := 0
+		s.hooks.commit = func(tx *sql.Tx) error {
+			commitAttempts++
+			return originalCommit(tx)
+		}
+		t.Cleanup(func() { s.hooks.commit = originalCommit })
+
+		report, err := s.RepairObservationMutationTitles("project-a", false)
+		if err != nil {
+			t.Fatalf("plan repair: %v", err)
+		}
+		if commitAttempts != 0 || len(report.Actions) != 1 {
+			t.Fatalf("commit attempts=%d report=%+v", commitAttempts, report)
+		}
+	})
+
+	t.Run("reports only actions from the successful apply retry", func(t *testing.T) {
 		s, _, _, _ := seed(t, "Recovered title. More detail.", func(map[string]json.RawMessage) {})
 		oldBackoffs := sqliteWriteRetryBackoffs
 		sqliteWriteRetryBackoffs = []time.Duration{0}
@@ -12222,9 +12340,9 @@ func TestRepairObservationMutationTitles(t *testing.T) {
 		}
 		t.Cleanup(func() { s.hooks.commit = originalCommit })
 
-		report, err := s.RepairObservationMutationTitles("project-a", false)
+		report, err := s.RepairObservationMutationTitles("project-a", true)
 		if err != nil {
-			t.Fatalf("repair after retry: %v", err)
+			t.Fatalf("apply after retry: %v", err)
 		}
 		if commitAttempts != 2 || len(report.Actions) != 1 {
 			t.Fatalf("commit attempts=%d report=%+v", commitAttempts, report)
