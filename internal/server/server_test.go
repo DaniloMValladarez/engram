@@ -4042,3 +4042,62 @@ func TestHandleUpdateObservationRejectsBlankTitleWithoutSideEffects(t *testing.T
 		t.Fatalf("expected 404 for missing observation, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestListProjectsEndpoint(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateSession("s-1", "alpha", t.TempDir()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := st.AddObservation(store.AddObservationParams{SessionID: "s-1", Type: "note", Title: "alpha note", Content: "content", Project: "alpha"}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/projects", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /projects = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Projects []store.ProjectStats `json:"projects"`
+		Count    int                  `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /projects response: %v", err)
+	}
+	if body.Count != 1 || len(body.Projects) != 1 {
+		t.Fatalf("expected 1 project, got count=%d projects=%d", body.Count, len(body.Projects))
+	}
+	if body.Projects[0].Name != "alpha" {
+		t.Fatalf("expected project alpha, got %q", body.Projects[0].Name)
+	}
+	if body.Projects[0].ObservationCount != 1 {
+		t.Fatalf("expected 1 observation for alpha, got %d", body.Projects[0].ObservationCount)
+	}
+}
+
+func TestListProjectsEndpointEmptyStore(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/projects", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /projects on empty store = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Projects []store.ProjectStats `json:"projects"`
+		Count    int                  `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /projects response: %v", err)
+	}
+	if body.Count != 0 || body.Projects == nil || len(body.Projects) != 0 {
+		t.Fatalf("expected empty successful listing, got count=%d projects=%v", body.Count, body.Projects)
+	}
+}
