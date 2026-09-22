@@ -5267,7 +5267,7 @@ func (s *Store) ExportRelationMutations(project string) ([]SyncMutation, error) 
 	if err != nil {
 		return nil, fmt.Errorf("export relation mutations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	mutations := []SyncMutation{}
 	for rows.Next() {
@@ -5295,6 +5295,87 @@ func (s *Store) ExportRelationMutations(project string) ([]SyncMutation, error) 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("export relation mutations: rows: %w", err)
 	}
+	return mutations, nil
+}
+
+// ExportLocalDeleteTombstones projects locally retained hard-delete intent into canonical mutations.
+func (s *Store) ExportLocalDeleteTombstones(project string) ([]SyncMutation, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	where, args := "active = 1", []any{}
+	if project != "" {
+		where += " AND project = ?"
+		args = append(args, project)
+	}
+	mutations := make([]SyncMutation, 0)
+	rows, err := s.queryItHook(s.db, `SELECT entity, entity_key, ifnull(session_id, ''), project, deleted_at, hard_delete FROM sync_delete_tombstones WHERE entity IN (?, ?) AND `+where, append([]any{SyncEntityObservation, SyncEntitySession}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("export local delete tombstones: %w", err)
+	}
+	for rows.Next() {
+		var entity, key, sessionID, rowProject, deletedAt string
+		var hardDelete bool
+		if err := rows.Scan(&entity, &key, &sessionID, &rowProject, &deletedAt, &hardDelete); err != nil {
+			return nil, closeRowsWithError(rows, err)
+		}
+		var payload any
+		if entity == SyncEntityObservation {
+			payload = syncObservationPayload{SyncID: key, SessionID: sessionID, Project: nullableString(rowProject), Deleted: true, DeletedAt: &deletedAt, HardDelete: hardDelete}
+		} else {
+			payload = syncSessionPayload{ID: key, Project: rowProject, Deleted: true, DeletedAt: &deletedAt, HardDelete: hardDelete}
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return nil, closeRowsWithError(rows, err)
+		}
+		mutations = append(mutations, SyncMutation{Entity: entity, EntityKey: key, Op: SyncOpDelete, Payload: string(raw), Project: rowProject, OccurredAt: deletedAt})
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	promptWhere, promptArgs := "1 = 1", []any{}
+	if project != "" {
+		promptWhere += " AND coalesce(nullif(p.project, ''), nullif(s.project, ''), ifnull((SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = p.session_id AND st.active = 1), '')) = ?"
+		promptArgs = append(promptArgs, project)
+	}
+	promptRows, err := s.queryItHook(s.db, `
+		SELECT p.sync_id, ifnull(p.session_id, ''), coalesce(nullif(p.project, ''), nullif(s.project, ''), ifnull((SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = p.session_id AND st.active = 1), '')), p.deleted_at
+		FROM prompt_tombstones p LEFT JOIN sessions s ON s.id = p.session_id
+		WHERE `+promptWhere, promptArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("export local prompt tombstones: %w", err)
+	}
+	for promptRows.Next() {
+		var syncID, sessionID, rowProject, deletedAt string
+		if err := promptRows.Scan(&syncID, &sessionID, &rowProject, &deletedAt); err != nil {
+			return nil, closeRowsWithError(promptRows, err)
+		}
+		raw, err := json.Marshal(syncPromptPayload{SyncID: syncID, SessionID: sessionID, Project: nullableString(rowProject), Deleted: true, DeletedAt: &deletedAt, HardDelete: true})
+		if err != nil {
+			return nil, closeRowsWithError(promptRows, err)
+		}
+		mutations = append(mutations, SyncMutation{Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: string(raw), Project: rowProject, OccurredAt: deletedAt})
+	}
+	if err := promptRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := promptRows.Err(); err != nil {
+		return nil, err
+	}
+	rank := map[string]int{SyncEntityObservation: 0, SyncEntityPrompt: 1, SyncEntitySession: 2}
+	sort.Slice(mutations, func(i, j int) bool {
+		if rank[mutations[i].Entity] != rank[mutations[j].Entity] {
+			return rank[mutations[i].Entity] < rank[mutations[j].Entity]
+		}
+		if mutations[i].OccurredAt != mutations[j].OccurredAt {
+			return mutations[i].OccurredAt < mutations[j].OccurredAt
+		}
+		return mutations[i].EntityKey < mutations[j].EntityKey
+	})
 	return mutations, nil
 }
 
@@ -8293,26 +8374,26 @@ func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string)
 		return err
 	}
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, ownership_mode, directory) VALUES (?, ?, ?, ?)
+		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
 		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END`,
-		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		id, project, mode, directory, Now(), sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	return err
 }
 
 func (s *Store) startSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
 	result, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, ownership_mode, directory, runtime_lease_expires_at) VALUES (?, ?, ?, ?, datetime('now', ?))
+		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at, runtime_lease_expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', ?))
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
 		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END,
 		   runtime_lease_expires_at = excluded.runtime_lease_expires_at
 		 WHERE sessions.ended_at IS NULL`,
-		id, project, mode, directory, runtimeSessionLeaseDuration, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		id, project, mode, directory, Now(), runtimeSessionLeaseDuration, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	if err != nil {
 		return err
@@ -8594,6 +8675,21 @@ func (s *Store) clearSyncDeleteTombstoneForUpsertTx(tx *sql.Tx, entity, entityKe
 	}
 	_, err := s.execHook(tx, `UPDATE sync_delete_tombstones SET active = 0 WHERE entity = ? AND entity_key = ?`, entity, entityKey)
 	return err
+}
+
+func (s *Store) localUpsertBlockedByTombstoneTx(tx *sql.Tx, entity, entityKey, generation string) (bool, error) {
+	var deletedAt string
+	var hardDelete bool
+	err := tx.QueryRow(`SELECT deleted_at, hard_delete FROM sync_delete_tombstones WHERE entity = ? AND entity_key = ?`, entity, entityKey).Scan(&deletedAt, &hardDelete)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || !hardDelete {
+		return false, err
+	}
+	generation = normalizeComparableTimestamp(generation)
+	deletedAt = normalizeComparableTimestamp(deletedAt)
+	return generation != "" && deletedAt != "" && generation <= deletedAt, nil
 }
 
 func (s *Store) cloudUpsertBlockedByTombstoneTx(tx *sql.Tx, targetKey, entity, entityKey string, seq int64) (bool, error) {
@@ -9815,13 +9911,25 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 			return fmt.Errorf("%w: %v", ErrPulledSessionIdentityInvalid, err)
 		}
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
-			if err := s.applySessionDeleteTx(tx, payload); err != nil || !cloud {
+			if err := s.applySessionDeleteTx(tx, payload); err != nil {
 				return err
 			}
-			return s.recordCloudDeleteTombstoneTx(tx, targetKey, SyncEntitySession, payload.ID, "", payload.Project, payload.DeletedAt, payload.HardDelete, mutation.Seq)
+			if cloud {
+				return s.recordCloudDeleteTombstoneTx(tx, targetKey, SyncEntitySession, payload.ID, "", payload.Project, payload.DeletedAt, payload.HardDelete, mutation.Seq)
+			}
+			deletedAt := strings.TrimSpace(derefString(payload.DeletedAt))
+			if deletedAt == "" {
+				deletedAt = Now()
+			}
+			return s.recordSyncDeleteTombstoneTx(tx, SyncEntitySession, payload.ID, "", payload.Project, deletedAt)
 		}
 		if cloud {
 			blocked, err := s.cloudUpsertBlockedByTombstoneTx(tx, targetKey, SyncEntitySession, payload.ID, mutation.Seq)
+			if err != nil || blocked {
+				return err
+			}
+		} else {
+			blocked, err := s.localUpsertBlockedByTombstoneTx(tx, SyncEntitySession, payload.ID, payload.StartedAt)
 			if err != nil || blocked {
 				return err
 			}
@@ -9844,17 +9952,32 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 			return fmt.Errorf("%w: mutation entity_key %q does not match payload sync_id %q", ErrPulledObservationIdentityInvalid, entityKey, payload.SyncID)
 		}
 		if mutation.Op == SyncOpDelete {
-			if err := s.applyObservationDeleteTx(tx, payload); err != nil || !cloud {
+			deletedAt := strings.TrimSpace(derefString(payload.DeletedAt))
+			if err := s.applyObservationDeleteTx(tx, payload); err != nil {
 				return err
 			}
-			entityKey := payload.SyncID
-			if strings.TrimSpace(entityKey) == "" {
-				entityKey = mutation.EntityKey
+			if !cloud {
+				if !payload.HardDelete {
+					return nil
+				}
+				if deletedAt == "" {
+					deletedAt = Now()
+				}
+				return s.recordSyncDeleteTombstoneTx(tx, SyncEntityObservation, payload.SyncID, payload.SessionID, derefString(payload.Project), deletedAt)
 			}
-			return s.recordCloudDeleteTombstoneTx(tx, targetKey, SyncEntityObservation, entityKey, payload.SessionID, derefString(payload.Project), payload.DeletedAt, payload.HardDelete, mutation.Seq)
+			return s.recordCloudDeleteTombstoneTx(tx, targetKey, SyncEntityObservation, payload.SyncID, payload.SessionID, derefString(payload.Project), payload.DeletedAt, payload.HardDelete, mutation.Seq)
 		}
 		if cloud {
 			blocked, err := s.cloudUpsertBlockedByTombstoneTx(tx, targetKey, SyncEntityObservation, payload.SyncID, mutation.Seq)
+			if err != nil || blocked {
+				return err
+			}
+		} else {
+			generation := payload.UpdatedAt
+			if strings.TrimSpace(generation) == "" {
+				generation = payload.CreatedAt
+			}
+			blocked, err := s.localUpsertBlockedByTombstoneTx(tx, SyncEntityObservation, payload.SyncID, generation)
 			if err != nil || blocked {
 				return err
 			}
@@ -11353,9 +11476,9 @@ func ClassifyTool(toolName string) string {
 	}
 }
 
-// Now returns the current time formatted for SQLite.
+// Now returns the current time formatted for SQLite with persisted generation precision.
 func Now() string {
-	return time.Now().UTC().Format("2006-01-02 15:04:05")
+	return time.Now().UTC().Format("2006-01-02 15:04:05.000000000")
 }
 
 // ─── Test-accessor helpers (REQ-009 / Phase G integration tests) ──────────────

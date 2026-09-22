@@ -1487,7 +1487,7 @@ func TestExportedChunkKeysObservationMutationIdentity(t *testing.T) {
 			transport := newFakeCloudTransport()
 			transport.chunks["history"] = raw
 			sy := NewWithTransport(nil, transport)
-			_, available, historical, err := sy.exportedChunkKeys(&Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "history"}}})
+			_, available, historical, _, err := sy.exportedChunkKeys(&Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "history"}}})
 			if err != nil {
 				t.Fatalf("exportedChunkKeys: %v", err)
 			}
@@ -4568,15 +4568,15 @@ func TestFilterFunctionsAndTimeNormalization(t *testing.T) {
 		t.Fatalf("unexpected new prompts: %+v", newOnly.Prompts)
 	}
 
-	if got := normalizeTime("2025-01-01T15:04:05Z"); got != "2025-01-01 15:04:05" {
+	if got := normalizeTime("2025-01-01T15:04:05.123456789Z"); got != "2025-01-01 15:04:05.123456789" {
 		t.Fatalf("unexpected RFC3339 normalization: %q", got)
 	}
 	if got := normalizeTime(" 2025-01-01 15:04:05 "); got != "2025-01-01 15:04:05" {
 		t.Fatalf("unexpected plain normalization: %q", got)
 	}
 
-	m := &Manifest{Chunks: []ChunkEntry{{ID: "old", CreatedAt: "2025-01-01T00:00:00Z"}, {ID: "new", CreatedAt: "2025-02-01T00:00:00Z"}}}
-	if got := sy.lastChunkTime(m); got != "2025-02-01T00:00:00Z" {
+	m := &Manifest{Chunks: []ChunkEntry{{ID: "old", CreatedAt: "2025-02-01T00:00:00Z"}, {ID: "new", CreatedAt: "2025-02-01T00:00:00.5Z"}}}
+	if got := sy.lastChunkTime(m); got != "2025-02-01T00:00:00.5Z" {
 		t.Fatalf("unexpected last chunk time: %q", got)
 	}
 }
