@@ -6,9 +6,30 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsDriveTypeClassifier(t *testing.T) {
+	tests := []struct {
+		name      string
+		driveType uint32
+		want      filesystemSupport
+	}{
+		{name: "remote", driveType: windowsDriveRemote, want: filesystemRemote},
+		{name: "fixed", driveType: windowsDriveFixed, want: filesystemLocal},
+		{name: "unknown", driveType: 0, want: filesystemUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyWindowsDriveType(tt.driveType).Support; got != tt.want {
+				t.Errorf("classifyWindowsDriveType(%d) support = %q, want %q", tt.driveType, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestWindowsFilesystemResolverRequestsOpenedName(t *testing.T) {
 	dataDir := t.TempDir()
@@ -51,6 +72,40 @@ func TestWindowsFilesystemAdapterRejectsResolvedRemotePath(t *testing.T) {
 	}
 }
 
+func TestWindowsFilesystemAdapterNormalizesExtendedUNC(t *testing.T) {
+	const extended = `\\?\UNC\server\share\data`
+	dataDir := t.TempDir()
+	name, err := windows.UTF16FromString(extended)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := windowsFinalPathNameByHandle
+	t.Cleanup(func() { windowsFinalPathNameByHandle = original })
+	var calls int
+	windowsFinalPathNameByHandle = func(_ windows.Handle, buffer *uint16, size, _ uint32) (uint32, error) {
+		calls++
+		if size < uint32(len(name)) {
+			return uint32(len(name)), nil
+		}
+		copy(unsafe.Slice(buffer, size), name)
+		return uint32(len(name) - 1), nil // Exclude the UTF-16 terminator.
+	}
+	var gotRoot string
+	originalDriveType := windowsDriveType
+	t.Cleanup(func() { windowsDriveType = originalDriveType })
+	windowsDriveType = func(root string) (uint32, error) {
+		gotRoot = root
+		return windowsDriveRemote, nil
+	}
+	info, err := detectFilesystem(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls == 0 || gotRoot != `\\server\share\` || info.Support != filesystemRemote {
+		t.Fatalf("final path calls = %d, drive root = %q, support = %q; want resolver call, UNC share root and remote", calls, gotRoot, info.Support)
+	}
+}
+
 func TestWindowsFilesystemAdapterAllowsTemporaryDirectory(t *testing.T) {
 	dataDir := t.TempDir()
 	setWindowsFilesystemAdapter(t, resolveWindowsFinalPath, func(string) (uint32, error) { return windowsDriveFixed, nil })
@@ -61,9 +116,10 @@ func TestWindowsFilesystemAdapterAllowsTemporaryDirectory(t *testing.T) {
 
 func TestWindowsFilesystemAdapterPropagatesResolverError(t *testing.T) {
 	want := errors.New("resolve path")
-	original := resolveWindowsPath
-	resolveWindowsPath = func(string) (string, error) { return "", want }
-	t.Cleanup(func() { resolveWindowsPath = original })
+	setWindowsFilesystemAdapter(t,
+		func(string) (string, error) { return "", want },
+		func(string) (uint32, error) { return windowsDriveFixed, nil },
+	)
 	if _, err := detectFilesystem("data"); !errors.Is(err, want) {
 		t.Fatalf("detectFilesystem error = %v, want %v", err, want)
 	}

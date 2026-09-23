@@ -8,6 +8,7 @@
 - [Install from source (macOS / Linux)](#install-from-source-macos--linux)
 - [Download binary (all platforms)](#download-binary-all-platforms)
 - [Requirements](#requirements)
+- [Data-directory filesystem safety](#data-directory-filesystem-safety)
 - [Environment Variables](#environment-variables)
 - [Windows Config Paths](#windows-config-paths)
 
@@ -197,6 +198,26 @@ Grab the latest release for your platform from [GitHub Releases](https://github.
 - That's it. No runtime dependencies.
 
 The binary includes SQLite (via [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) — pure Go, no CGO). Works natively on **macOS**, **Linux**, and **Windows** (x86_64 and ARM64).
+
+---
+
+## Data-directory filesystem safety
+
+Engram uses persistent SQLite WAL and rejects known NFS and SMB/CIFS data directories before changing the SQLite files. Use a local disk for `ENGRAM_DATA_DIR`; an unknown filesystem remains compatible but is not proven local.
+
+If startup rejects a network data directory, stop **all** Engram processes. Copy the complete `engram.db`, `engram.db-wal`, and `engram.db-shm` triplet to local storage, set `ENGRAM_DATA_DIR` to the absolute path of that local directory (relative paths are rejected), then start Engram and run `engram doctor`. Check SQLite integrity with the command for your shell:
+
+```bash
+# POSIX shell or Git Bash
+sqlite3 "$ENGRAM_DATA_DIR/engram.db" "PRAGMA integrity_check;"
+```
+
+```powershell
+# PowerShell
+sqlite3 (Join-Path $env:ENGRAM_DATA_DIR 'engram.db') 'PRAGMA integrity_check;'
+```
+
+Engram does not auto-repair, quarantine, checkpoint, or use rollback journaling as a fallback.
 
 ---
 
