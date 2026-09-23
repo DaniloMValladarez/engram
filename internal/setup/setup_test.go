@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -3473,6 +3474,59 @@ func TestClaudeCodeUserPromptHookIncludesPowerShellFallback(t *testing.T) {
 			t.Fatalf("PowerShell user prompt hook missing %q", want)
 		}
 	}
+}
+
+func TestClaudePreToolUseHookUsesWindowsPortableCommand(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read Claude Code hooks config: %v", err)
+	}
+
+	var cfg struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Hooks   []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse Claude Code hooks config: %v", err)
+	}
+
+	for _, entry := range cfg.Hooks["PreToolUse"] {
+		for _, hook := range entry.Hooks {
+			if hook.Command != "engram hook claude-pre-tool-use" {
+				continue
+			}
+			if strings.ContainsAny(hook.Command, `/$`) || strings.Contains(strings.ToLower(hook.Command), "bash") {
+				t.Fatalf("PreToolUse command %q is not portable to Windows", hook.Command)
+			}
+			// Current manifest uses only JS-compatible literal alternatives and groups.
+			if !strings.HasPrefix(entry.Matcher, "^") || !strings.HasSuffix(entry.Matcher, "$") {
+				t.Fatalf("PreToolUse matcher must be anchored: %q", entry.Matcher)
+			}
+			matcher, err := regexp.Compile(entry.Matcher)
+			if err != nil {
+				t.Fatalf("invalid PreToolUse matcher %q: %v", entry.Matcher, err)
+			}
+			for _, prefix := range []string{"mcp__engram__", "mcp__plugin_engram_engram__"} {
+				if !matcher.MatchString(prefix+"mem_session_end") || !matcher.MatchString(prefix+"mem_save") {
+					t.Errorf("PreToolUse matcher %q misses representative writes for %s", entry.Matcher, prefix)
+				}
+				for _, tool := range []string{"mem_search", "mem_save_extra"} {
+					if matcher.MatchString(prefix + tool) {
+						t.Errorf("PreToolUse matcher %q accepts %s%s", entry.Matcher, prefix, tool)
+					}
+				}
+			}
+			if matcher.MatchString("mcp__other__mem_save") {
+				t.Errorf("PreToolUse matcher %q accepts unrelated server", entry.Matcher)
+			}
+			return
+		}
+	}
+	t.Fatal("Claude PreToolUse manifest is missing the portable core hook command")
 }
 
 func TestClaudeCodeUserPromptSubmitHookTimeout(t *testing.T) {
