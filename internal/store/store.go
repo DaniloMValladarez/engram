@@ -702,13 +702,32 @@ func (d ExportData) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// exportedSessionDirectory is an import-only auxiliary projection used by
+// ExportData.UnmarshalJSON to decode each session's directory through a raw
+// JSON value. Session's plain `json:"directory"` string tag silently folds a
+// JSON null into "", so the snapshot decode inspects the raw token first: an
+// absent directory key stays missing (blank directory, accepted), a present
+// JSON string is preserved exactly (blank and whitespace included), and JSON
+// null or any non-string token is rejected with an error naming the offending
+// session. This admission rule is separate from the pulled-chunk validator
+// (validatePulledSessionDirectoryLocal), which governs a different payload.
+type exportedSessionDirectory struct {
+	ID        string          `json:"id"`
+	Directory json.RawMessage `json:"directory"`
+}
+
 // UnmarshalJSON accepts both the current backup projection and legacy 0.1.0
 // exports, where pinned and relations are absent and therefore retain defaults.
+//
+// Directory admission is part of the decode: an absent directory key is treated
+// as missing (blank directory, accepted), a present JSON string is preserved
+// exactly (blank and whitespace included), and JSON null or any non-string
+// token fails the whole unmarshal with an error naming the offending session.
 func (d *ExportData) UnmarshalJSON(data []byte) error {
 	var decoded struct {
 		Version      string              `json:"version"`
 		ExportedAt   string              `json:"exported_at"`
-		Sessions     []Session           `json:"sessions"`
+		Sessions     []json.RawMessage   `json:"sessions"`
 		Observations []backupObservation `json:"observations"`
 		Prompts      []Prompt            `json:"prompts"`
 		Relations    []BackupRelation    `json:"relations"`
@@ -716,13 +735,32 @@ func (d *ExportData) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
+	var sessions []Session
+	if decoded.Sessions != nil {
+		sessions = make([]Session, len(decoded.Sessions))
+	}
+	for i, rawSession := range decoded.Sessions {
+		var directory exportedSessionDirectory
+		if err := json.Unmarshal(rawSession, &directory); err != nil {
+			return err
+		}
+		if raw := directory.Directory; raw != nil {
+			var value *string
+			if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+				return fmt.Errorf("import session %q: directory must be a JSON string", directory.ID)
+			}
+		}
+		if err := json.Unmarshal(rawSession, &sessions[i]); err != nil {
+			return err
+		}
+	}
 	observations := make([]Observation, len(decoded.Observations))
 	for i, observation := range decoded.Observations {
 		observation.Observation.Pinned = observation.Pinned
 		observations[i] = observation.Observation
 	}
 	*d = ExportData{
-		Version: decoded.Version, ExportedAt: decoded.ExportedAt, Sessions: decoded.Sessions,
+		Version: decoded.Version, ExportedAt: decoded.ExportedAt, Sessions: sessions,
 		Observations: observations, Prompts: decoded.Prompts, Relations: decoded.Relations,
 	}
 	return nil
@@ -5541,12 +5579,13 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	if data.Version != "" && data.Version != legacyExportVersion && data.Version != currentExportVersion {
 		return nil, fmt.Errorf("import: unsupported export version %q", data.Version)
 	}
+	// A blank or whitespace directory is a legitimate local partial session, so
+	// it is accepted and preserved exactly as carried (engram#1287). Completion
+	// happens through createSessionTx/startSessionTx's upsert CASE when a later
+	// non-blank directory arrives under the same id.
 	for _, sess := range data.Sessions {
 		if err := validateSessionID(sess.ID); err != nil {
 			return nil, fmt.Errorf("import session: %w", err)
-		}
-		if strings.TrimSpace(sess.Directory) == "" {
-			return nil, fmt.Errorf("import session %s: %w: directory is required", sess.ID, ErrPulledSessionDirectoryInvalid)
 		}
 		if strings.TrimSpace(sess.OwnershipMode) != "" && !validSessionOwnershipMode(sess.OwnershipMode) {
 			return nil, fmt.Errorf("import session %s: %w %q", sess.ID, ErrInvalidSessionOwnershipMode, sess.OwnershipMode)
@@ -7044,8 +7083,9 @@ func (s *Store) EnqueueDeferredRelation(targetKey string, mutation SyncMutation)
 }
 
 // ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
-// and records the chunk as synced in the same transaction. This guarantees
-// retry safety: a failed chunk import leaves no partial semantic mutations.
+// under the local import domain and records the chunk as synced in the same
+// transaction. This guarantees retry safety: a failed chunk import leaves no
+// partial semantic mutations.
 //
 // It shares ApplyPulledMutation's skip-plus-evidence rule for invalid session
 // and observation identities, plus deferred handling for observation and prompt
@@ -7055,6 +7095,20 @@ func (s *Store) EnqueueDeferredRelation(targetKey string, mutation SyncMutation)
 // whole chunk, because an undecodable payload is a transport-level fault rather
 // than known-corrupt historical data.
 func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
+	return s.ApplyPulledChunkForDomain(targetKey, chunkID, mutations, false)
+}
+
+// ApplyPulledChunkForDomain is ApplyPulledChunk with an explicit import domain.
+// The domain must be carried explicitly by the caller; it is never inferred
+// from the target key, because a cloud chunk's tracking key and its admission
+// rule answer different questions. cloud=true runs the strict cloud-inbound
+// directory admission (validatePulledSessionDirectory), so a session upsert
+// with a blank or missing directory fails the whole chunk atomically — no
+// session persisted, chunk not recorded — mirroring how ApplyPulledMutation
+// fails the same payload. cloud=false keeps the local partial-session domain:
+// blank directories are accepted and the skip-plus-evidence quarantine ladder
+// behaves exactly as before.
+func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations []SyncMutation, cloud bool) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
 	chunkID = strings.TrimSpace(chunkID)
@@ -7086,7 +7140,7 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 			mutation.Seq = seq
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
-			if applyErr := s.applyPulledMutationTx(tx, mutation); applyErr != nil {
+			if applyErr := s.applyPulledMutationForDomainTx(tx, mutation, cloud, targetKey); applyErr != nil {
 				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 				} else if !handled {
@@ -9937,7 +9991,7 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 				return err
 			}
 		}
-		if err := validatePulledSessionDirectory([]byte(mutation.Payload)); err != nil {
+		if err := validatePulledSessionDirectoryForDomain(cloud, []byte(mutation.Payload)); err != nil {
 			return err
 		}
 		return s.applySessionPayloadTx(tx, payload)
@@ -10000,6 +10054,21 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 	}
 }
 
+// validatePulledSessionDirectoryForDomain selects the directory admission rule
+// for a pulled session upsert. Cloud inbound stays strict byte-for-byte; the
+// local pull domain (ApplyPulledChunk and the deferred replay it feeds) accepts
+// a blank directory as the intentional local partial-session state.
+func validatePulledSessionDirectoryForDomain(cloud bool, raw []byte) error {
+	if cloud {
+		return validatePulledSessionDirectory(raw)
+	}
+	return validatePulledSessionDirectoryLocal(raw)
+}
+
+// validatePulledSessionDirectory is the strict cloud-inbound admission check
+// (ApplyPulledMutation / autosync). A missing directory key and a blank value
+// are both rejected with the historical wording; cloud payloads must name a
+// concrete directory because the cloud has no local state to complete against.
 func validatePulledSessionDirectory(raw []byte) error {
 	var fields map[string]json.RawMessage
 	if err := decodeSyncPayload(raw, &fields); err != nil {
@@ -10012,6 +10081,31 @@ func validatePulledSessionDirectory(raw []byte) error {
 	var value string
 	if err := json.Unmarshal(directory, &value); err != nil || strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%w: directory must be non-blank", ErrPulledSessionDirectoryInvalid)
+	}
+	return nil
+}
+
+// validatePulledSessionDirectoryLocal is the local pull-path admission check.
+// It accepts ONLY a missing directory key (decoding to blank) or a JSON string
+// value (blank included), so a local partial session round-trips through pulled
+// chunks without being rejected, spliced, or normalized: the payload bytes are
+// applied as carried and the stored session keeps the blank directory
+// (engram#1287). Transport-level faults (undecodable raw), JSON null, and
+// non-string directory values stay rejected. The pointer decode is what keeps
+// JSON null out: unmarshalling null into a plain string is a silent no-op that
+// would otherwise masquerade as a blank value.
+func validatePulledSessionDirectoryLocal(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := decodeSyncPayload(raw, &fields); err != nil {
+		return err
+	}
+	directory, ok := fields["directory"]
+	if !ok {
+		return nil
+	}
+	var value *string
+	if err := json.Unmarshal(directory, &value); err != nil || value == nil {
+		return fmt.Errorf("%w: directory must be a string", ErrPulledSessionDirectoryInvalid)
 	}
 	return nil
 }
@@ -10412,6 +10506,13 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 	}
 }
 
+// applySessionPayloadTx upserts a pulled session with the same directory
+// completion CASE as createSessionTx/startSessionTx: an existing concrete
+// directory is preserved (a later blank payload cannot erase it) and an
+// existing blank adopts an incoming concrete value. Cloud callers always pass
+// the strict directory validation before reaching this upsert, so their
+// payloads carry concrete directories and keep whichever concrete value
+// arrived first.
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
 	if err := validateSessionID(payload.ID); err != nil {
 		return err
@@ -10430,11 +10531,11 @@ func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) er
 		   ownership_mode = CASE
 		     WHEN sessions.ownership_mode = 'project_owned' OR excluded.ownership_mode IS NULL THEN sessions.ownership_mode
 		     ELSE excluded.ownership_mode END,
-		   directory = excluded.directory,
+		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END,
 		   started_at = COALESCE(NULLIF(excluded.started_at, ''), sessions.started_at),
 		   ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
 		   summary = COALESCE(excluded.summary, sessions.summary)`,
-		payload.ID, payload.Project, nullableOwnershipMode(payload.OwnershipMode), payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
+		payload.ID, payload.Project, nullableOwnershipMode(payload.OwnershipMode), payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary, sqlWhitespaceTrimSet,
 	)
 	if err != nil {
 		return err
