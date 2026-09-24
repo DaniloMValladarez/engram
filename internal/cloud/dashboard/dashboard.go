@@ -1,6 +1,6 @@
 package dashboard
 
-//go:generate go tool templ generate
+//go:generate go -C ../../.. tool templ generate ./internal/cloud/dashboard/...
 
 import (
 	"context"
