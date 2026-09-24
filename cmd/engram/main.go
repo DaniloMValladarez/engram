@@ -703,6 +703,21 @@ func main() {
 		return
 	}
 
+	// Help for backup commands must not resolve configuration or open a store.
+	if os.Args[1] == "export" || os.Args[1] == "import" {
+		for _, arg := range os.Args[2:] {
+			if arg != "--help" {
+				continue
+			}
+			if os.Args[1] == "export" {
+				fmt.Println("Usage: engram export [file.json] [--project NAME | --all]\n\nOptions:\n  --project NAME  Export one project (default: current project)\n  --all           Export every project\n  --help          Show this help")
+			} else {
+				fmt.Println("Usage: engram import <file.json>\n\nOptions:\n  --help          Show this help")
+			}
+			return
+		}
+	}
+
 	if shouldCheckForUpdates(os.Args[1:]) {
 		printUpdateCheckResult(checkForUpdates(version))
 	}
