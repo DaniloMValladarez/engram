@@ -29,6 +29,7 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 | VS Code Copilot | `engram setup vscode-copilot`                                                                | [Details](#vs-code-copilot--claude-code-extension) |
 | Kilo Code       | `engram setup kilocode`                                                                      | [Details](#kilo-code)                              |
 | Kimi Code       | `engram setup kimi`                                                                          | [Details](#kimi-code)                              |
+| CommandCode     | `engram setup commandcode`                                                                   | [Details](#commandcode)                            |
 | Any MCP agent   | `engram mcp` (stdio)                                                                         | [Details](#any-other-mcp-agent)                    |
 
 > **Native setup for all agents above.** `engram setup <agent>` configures the
@@ -735,6 +736,18 @@ engram setup kimi
 Registers `mcpServers.engram` in `~/.kimi-code/mcp.json` and writes the Memory Protocol as a marker block in `~/.kimi-code/AGENTS.md`. Both files live under the Kimi Code data root, so when `KIMI_CODE_HOME` is set the setup honors it and writes there instead.
 
 **`KIMI_CODE_HOME` is only honored when it is an absolute path.** A relative value (for example `KIMI_CODE_HOME=.kimi-code`) is ignored and setup falls back to the default `~/.kimi-code` root, so config never lands in whatever directory you happened to run `engram` from. The `Next steps` printed after setup name the files that were actually written, so they follow the override.
+
+---
+
+## CommandCode
+
+**Automated:**
+
+```bash
+engram setup commandcode
+```
+
+Registers `mcpServers.engram` in the user-scope `~/.commandcode/mcp.json` (private, available across all projects) and writes the Memory Protocol as a marker block in the user-tier `~/.commandcode/AGENTS.md`. Memory is re-read every request, so `AGENTS.md` edits apply on the next turn with no restart; restart the session so the MCP server is picked up. On Windows the CLI binary is `cmdc` instead of `cmd`, but the config paths are the same.
 
 ---
 

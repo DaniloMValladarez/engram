@@ -31,6 +31,7 @@ func declarativeAgents() []declarativeAgent {
 		{"cursor", cursorMCPPath, "mcpServers", mcpServersObject, cursorMemoryProtocolPath, wholeFile},
 		{"vscode-copilot", vscodeMCPPath, "servers", serversObject, vscodePromptPath, wholeFile},
 		{"kilocode", kilocodeConfigPath, "mcp", opencodeObject, kilocodeAgentsPath, markerBlock},
+		{"commandcode", commandcodeMCPPath, "mcpServers", commandCodeObject, commandcodeAgentsPath, markerBlock},
 		{"kimi", kimiMCPPath, "mcpServers", mcpServersObject, kimiAgentsPath, markerBlock},
 	}
 }
@@ -60,7 +61,7 @@ func TestSupportedAgentsIncludesAllRegistryAgents(t *testing.T) {
 	want := []string{
 		"opencode", "pi", "claude-code", "gemini-cli", "codex",
 		"antigravity-cli", "windsurf", "qwen", "kiro", "cursor",
-		"vscode-copilot", "kilocode", "kimi",
+		"vscode-copilot", "kilocode", "commandcode", "kimi",
 	}
 	for _, slug := range want {
 		if !got[slug] {
@@ -135,6 +136,14 @@ func TestInstallDeclarativeAgentsRegisterMCPAndInstructions(t *testing.T) {
 				}
 				if agent.mcpFormat == serversObject && entry["type"] != "stdio" {
 					t.Errorf("%s: expected type stdio, got %#v", agent.slug, entry["type"])
+				}
+				if agent.mcpFormat == commandCodeObject {
+					if entry["transport"] != "stdio" {
+						t.Errorf("%s: expected transport stdio, got %#v", agent.slug, entry["transport"])
+					}
+					if entry["enabled"] != true {
+						t.Errorf("%s: expected enabled true, got %#v", agent.slug, entry["enabled"])
+					}
 				}
 			}
 
@@ -278,6 +287,71 @@ func TestInjectMCPPreservesExistingServersAndKeys(t *testing.T) {
 	}
 	if _, ok := servers["engram"]; !ok {
 		t.Errorf("expected engram server added")
+	}
+}
+
+func TestInstallCommandCodePreservesExistingUserConfig(t *testing.T) {
+	stubRegistryEnv(t)
+	mcpPath := commandcodeMCPPath()
+	agentsPath := commandcodeAgentsPath()
+	if err := os.MkdirAll(filepath.Dir(mcpPath), 0755); err != nil {
+		t.Fatalf("create CommandCode directory: %v", err)
+	}
+	const existingMCP = `{"theme":"dark","mcpServers":{"other":{"command":"other-server","args":["serve"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(existingMCP), 0644); err != nil {
+		t.Fatalf("seed MCP config: %v", err)
+	}
+	const userInstructions = "# My preferences\n\nKeep this instruction.\n"
+	if err := os.WriteFile(agentsPath, []byte(userInstructions), 0644); err != nil {
+		t.Fatalf("seed user instructions: %v", err)
+	}
+
+	for range 2 {
+		if _, err := Install("commandcode"); err != nil {
+			t.Fatalf("Install(commandcode): %v", err)
+		}
+	}
+
+	raw, err := os.ReadFile(mcpPath)
+	if err != nil {
+		t.Fatalf("read MCP config: %v", err)
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("parse MCP config: %v", err)
+	}
+	if string(config["theme"]) != `"dark"` {
+		t.Errorf("existing top-level setting changed: %s", config["theme"])
+	}
+	var servers map[string]json.RawMessage
+	if err := json.Unmarshal(config["mcpServers"], &servers); err != nil {
+		t.Fatalf("parse MCP servers: %v", err)
+	}
+	var other struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(servers["other"], &other); err != nil {
+		t.Fatalf("parse existing MCP server: %v", err)
+	}
+	if other.Command != "other-server" || len(other.Args) != 1 || other.Args[0] != "serve" {
+		t.Errorf("existing MCP server changed: %#v", other)
+	}
+	entry := readEngramEntry(t, mcpPath, "mcpServers")
+	if entry["transport"] != "stdio" || entry["enabled"] != true {
+		t.Errorf("CommandCode entry missing stdio transport or enabled flag: %#v", entry)
+	}
+
+	instructions, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("read user instructions: %v", err)
+	}
+	text := string(instructions)
+	if !strings.HasPrefix(text, userInstructions) {
+		t.Errorf("existing user instructions changed: %q", text)
+	}
+	if strings.Count(text, engramMarkerBegin) != 1 || strings.Count(text, engramMarkerEnd) != 1 {
+		t.Errorf("expected one managed protocol block after two installs: %q", text)
 	}
 }
 

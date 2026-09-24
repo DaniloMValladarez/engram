@@ -445,7 +445,7 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "[--match all|any]") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
-	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi"} {
+	for _, agent := range []string{"opencode", "pi", "claude-code", "gemini-cli", "codex", "antigravity-cli", "windsurf", "qwen", "kiro", "cursor", "vscode-copilot", "kilocode", "kimi", "commandcode"} {
 		if !strings.Contains(stdout, agent) {
 			t.Fatalf("usage missing setup agent %q: %q", agent, stdout)
 		}
@@ -565,6 +565,11 @@ func TestPrintPostInstall(t *testing.T) {
 		},
 		// kimi lives in TestPrintPostInstallKimiUsesEffectivePaths: its steps
 		// depend on KIMI_CODE_HOME, so the expectations need explicit env control.
+		{
+			name:    "commandcode",
+			result:  &setup.Result{Agent: "commandcode"},
+			expects: []string{"Restart the CommandCode session", "~/.commandcode/mcp.json", "~/.commandcode/AGENTS.md"},
+		},
 		{
 			name:   "unknown",
 			result: &setup.Result{Agent: "unknown"},
