@@ -74,7 +74,7 @@ func TestHealthReportsVersion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := New(nil, 0)
+			srv := New(newServerTestStore(t), 0)
 			if tt.setVersion {
 				srv.SetVersion(tt.version)
 			}
@@ -95,6 +95,30 @@ func TestHealthReportsVersion(t *testing.T) {
 				t.Fatalf("/health version = %q, want %q", response.Version, tt.version)
 			}
 		})
+	}
+}
+
+func TestHealthRejectsFailedStore(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	New(st, 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failed store health = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	assertGenericStoreError(t, rec, "health check failed")
+}
+
+func assertGenericStoreError(t *testing.T, rec *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if body["error"] != want || strings.Contains(strings.ToLower(rec.Body.String()), "database is closed") || strings.Contains(strings.ToLower(rec.Body.String()), "sqlite") {
+		t.Fatalf("unsafe or unexpected error response: %s; want %q", rec.Body.String(), want)
 	}
 }
 
@@ -2199,6 +2223,27 @@ func TestOnWriteNotCalledOnFailedWrites(t *testing.T) {
 	}
 }
 
+func TestStatsRejectsFailedStore(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/stats?all_projects=true", "/stats?project=alpha"} {
+		t.Run(path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			New(st, 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("failed store stats = %d, want 500: %s", rec.Code, rec.Body.String())
+			}
+			want := "stats unavailable"
+			if path == "/stats?project=alpha" {
+				want = "project resolution failed"
+			}
+			assertGenericStoreError(t, rec, want)
+		})
+	}
+}
+
 func TestHandleStatsReturnsInternalServerErrorOnLoaderError(t *testing.T) {
 	prev := loadServerStats
 	loadServerStats = func(s *store.Store) (*store.Stats, error) {
@@ -2258,6 +2303,7 @@ func TestProjectResolutionStoreFailureReturnsInternalErrorCode(t *testing.T) {
 	if body["code"] != "project_resolution_failed" {
 		t.Fatalf("resolution failure code = %#v, want project_resolution_failed: %s", body["code"], rec.Body.String())
 	}
+	assertGenericStoreError(t, rec, "project resolution failed")
 }
 
 // ─── DELETE /sessions/{id} tests ─────────────────────────────────────────────
