@@ -594,12 +594,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID            string `json:"id"`
-		Project       string `json:"project"`
-		Directory     string `json:"directory"`
-		OwnershipMode string `json:"ownership_mode"`
-		Resume        bool   `json:"resume"`
-		Isolated      bool   `json:"isolated"`
+		ID                string                   `json:"id"`
+		Project           string                   `json:"project"`
+		Directory         string                   `json:"directory"`
+		OwnershipMode     string                   `json:"ownership_mode"`
+		Resume            bool                     `json:"resume"`
+		Isolated          bool                     `json:"isolated"`
+		ProjectProvenance *store.ProjectProvenance `json:"project_provenance,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -610,6 +611,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	mode := body.OwnershipMode
 	if mode == "" {
 		mode = store.SessionOwnershipShared
@@ -621,13 +626,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	effectiveID := body.ID
 	timings := requestWriteTimings(r)
 	var err error
-	if body.Isolated {
-		effectiveID, err = s.store.RegisterIsolatedSessionTimed(body.ID, body.Project, body.Resume, timings)
-	} else if body.Resume {
-		effectiveID, err = s.store.ResumeSessionWithOwnershipModeTimed(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode, timings)
-	} else {
-		err = s.store.StartSessionWithOwnershipModeTimed(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode, timings)
-	}
+	effectiveID, err = s.store.RegisterSessionWithProjectProvenance(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode, body.Resume, body.Isolated, body.ProjectProvenance, timings)
 	if err != nil {
 		var conflict *store.SessionProjectConflictError
 		switch {
@@ -709,7 +708,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonResponse(w, http.StatusOK, session)
+	provenance, err := s.store.CaptureProjectProvenance("session", session.ID)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, struct {
+		*store.Session
+		ProjectProvenance *store.ProjectProvenance `json:"project_provenance,omitempty"`
+	}{session, provenance})
 }
 
 func (s *Server) handleGetObservationSaveResult(w http.ResponseWriter, r *http.Request) {
@@ -746,6 +753,10 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Validate the title before the session lookup so a bad session or project
@@ -798,9 +809,10 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 
 	if !result.Replayed {
 		if err := capturePromptForSave(s.store, body.CapturePrompt, store.AddPromptParams{
-			SessionID: body.SessionID,
-			Project:   body.Project,
-			Content:   body.CurrentPrompt,
+			SessionID:         body.SessionID,
+			Project:           body.Project,
+			Content:           body.CurrentPrompt,
+			ProjectProvenance: body.ProjectProvenance,
 		}); err != nil {
 			log.Printf("engram: auto prompt capture error (non-fatal): %v", err)
 		}
@@ -1270,6 +1282,10 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 	var body store.AddPromptParams
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if body.SessionID == "" || body.Content == "" {
