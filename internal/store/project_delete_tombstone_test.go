@@ -303,83 +303,198 @@ func TestDeleteProjectTombstoneSupersedesMutationOccurredAtSameInstant(t *testin
 }
 
 // TestDeleteProjectTombstoneKeepsSameSecondPostDeleteMutationPending pins the
-// sub-second fence end to end: mutations journalled through the real enqueue
-// path after a hard delete must stay pending even when everything happens
-// within the same wall-clock second. enqueueSyncMutationTx stamps occurred_at
-// with sub-second precision; the old second-precision column default made such
-// mutations compare occurred_at <= deleted_at and wrongly lose their content.
+// sub-second fence: a mutation journalled through the real enqueue path after a
+// hard delete must stay pending even when its occurred_at shares a wall-clock
+// second with the tombstone's deleted_at. enqueueSyncMutationWithSourceTx stamps
+// occurred_at with sub-second precision; the old second-precision column default
+// made such a mutation compare occurred_at <= deleted_at and lose its content.
+//
+// Real enqueue precision is checked before constructing temporal fixtures.
+// Both a same-second collision and a valid zero-fraction timestamp are exercised
+// without relying on wall-clock progress between delete and recreate.
 func TestDeleteProjectTombstoneKeepsSameSecondPostDeleteMutationPending(t *testing.T) {
-	s := newTestStore(t)
+	for _, tc := range []struct {
+		name         string
+		fraction     time.Duration
+		sharesSecond bool
+	}{
+		{name: "same-second", fraction: time.Nanosecond, sharesSecond: true},
+		{name: "zero-fraction", fraction: 0, sharesSecond: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
 
-	enrollTestProject(t, s, "hotel")
-	if err := s.CreateSession("s-tomb-pre-1", "hotel", "/tmp/hotel"); err != nil {
-		t.Fatalf("create pre-delete session: %v", err)
-	}
-	if _, err := s.AddObservation(AddObservationParams{
-		SessionID: "s-tomb-pre-1",
-		Type:      "decision",
-		Title:     "pre-delete observation",
-		Content:   "pre-delete content",
-		Project:   "hotel",
-		Scope:     "project",
-	}); err != nil {
-		t.Fatalf("add pre-delete observation: %v", err)
-	}
-	if err := s.UnenrollProject("hotel"); err != nil {
-		t.Fatalf("unenroll hotel: %v", err)
-	}
-	if _, err := s.DeleteProject("hotel", true); err != nil {
-		t.Fatalf("DeleteProject: %v", err)
-	}
+			enrollTestProject(t, s, "hotel")
+			if err := s.CreateSession("s-tomb-pre-1", "hotel", "/tmp/hotel"); err != nil {
+				t.Fatalf("create pre-delete session: %v", err)
+			}
+			if _, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-tomb-pre-1",
+				Type:      "decision",
+				Title:     "pre-delete observation",
+				Content:   "pre-delete content",
+				Project:   "hotel",
+				Scope:     "project",
+			}); err != nil {
+				t.Fatalf("add pre-delete observation: %v", err)
+			}
+			if err := s.UnenrollProject("hotel"); err != nil {
+				t.Fatalf("unenroll hotel: %v", err)
+			}
+			if _, err := s.DeleteProject("hotel", true); err != nil {
+				t.Fatalf("DeleteProject: %v", err)
+			}
 
-	// Recreate the project under the same name and journal fresh upserts right
-	// after the delete through the real enqueue path.
-	if err := s.EnrollProject("hotel"); err != nil {
-		t.Fatalf("re-enroll hotel: %v", err)
-	}
-	if err := s.CreateSession("s-tomb-post-1", "hotel", "/tmp/hotel"); err != nil {
-		t.Fatalf("create post-delete session: %v", err)
-	}
-	if _, err := s.AddObservation(AddObservationParams{
-		SessionID: "s-tomb-post-1",
-		Type:      "decision",
-		Title:     "post-delete observation",
-		Content:   "post-delete content",
-		Project:   "hotel",
-		Scope:     "project",
-	}); err != nil {
-		t.Fatalf("add post-delete observation: %v", err)
-	}
-	if err := s.UnenrollProject("hotel"); err != nil {
-		t.Fatalf("unenroll hotel again: %v", err)
-	}
+			// Recreate the project under the same name and journal fresh upserts right
+			// after the delete through the real enqueue path.
+			if err := s.EnrollProject("hotel"); err != nil {
+				t.Fatalf("re-enroll hotel: %v", err)
+			}
+			if err := s.CreateSession("s-tomb-post-1", "hotel", "/tmp/hotel"); err != nil {
+				t.Fatalf("create post-delete session: %v", err)
+			}
+			if _, err := s.AddObservation(AddObservationParams{
+				SessionID: "s-tomb-post-1",
+				Type:      "decision",
+				Title:     "post-delete observation",
+				Content:   "post-delete content",
+				Project:   "hotel",
+				Scope:     "project",
+			}); err != nil {
+				t.Fatalf("add post-delete observation: %v", err)
+			}
+			if err := s.UnenrollProject("hotel"); err != nil {
+				t.Fatalf("unenroll hotel again: %v", err)
+			}
 
-	report, err := s.SupersedeUnenrolledLegacyMutations(DefaultSyncTargetKey, "hotel", true)
-	if err != nil {
-		t.Fatalf("SupersedeUnenrolledLegacyMutations: %v", err)
-	}
-	var postObservationSyncID string
-	if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE session_id = 's-tomb-post-1'`).Scan(&postObservationSyncID); err != nil {
-		t.Fatalf("read post-delete observation sync_id: %v", err)
-	}
-	for _, action := range report.Actions {
-		if action.EntityKey == "s-tomb-post-1" || action.EntityKey == postObservationSyncID {
-			t.Fatalf("post-delete mutation %q was superseded (%+v); it must stay pending", action.EntityKey, action)
-		}
-	}
-	var disposition string
-	if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity = 'session' AND entity_key = 's-tomb-pre-1'`).Scan(&disposition); err != nil {
-		t.Fatalf("read pre-delete session disposition: %v", err)
-	}
-	if disposition != SyncMutationDispositionSuperseded {
-		t.Fatalf("pre-delete session disposition = %q, want %q", disposition, SyncMutationDispositionSuperseded)
-	}
-	for _, key := range []struct{ entity, entityKey string }{{"session", "s-tomb-post-1"}, {"observation", postObservationSyncID}} {
-		if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity = ? AND entity_key = ?`, key.entity, key.entityKey).Scan(&disposition); err != nil {
-			t.Fatalf("read post-delete %s disposition: %v", key.entity, err)
-		}
-		if disposition != SyncMutationDispositionPending {
-			t.Fatalf("post-delete %s disposition = %q, want %q (recreated project content must still sync)", key.entity, disposition, SyncMutationDispositionPending)
-		}
+			var postObservationSyncID string
+			if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE session_id = 's-tomb-post-1'`).Scan(&postObservationSyncID); err != nil {
+				t.Fatalf("read post-delete observation sync_id: %v", err)
+			}
+			postDelete := []struct {
+				entity    string
+				entityKey string
+				occurred  string
+			}{
+				{entity: "session", entityKey: "s-tomb-post-1"},
+				{entity: "observation", entityKey: postObservationSyncID},
+			}
+			for i := range postDelete {
+				if err := s.db.QueryRow(`SELECT occurred_at FROM sync_mutations WHERE entity = ? AND entity_key = ?`, postDelete[i].entity, postDelete[i].entityKey).Scan(&postDelete[i].occurred); err != nil {
+					t.Fatalf("read post-delete %s occurred_at: %v", postDelete[i].entity, err)
+				}
+				stamp, err := time.Parse("2006-01-02 15:04:05.000000000", postDelete[i].occurred)
+				if err != nil || stamp.Format("2006-01-02 15:04:05.000000000") != postDelete[i].occurred {
+					t.Fatalf("post-delete %s occurred_at = %q, want nine fractional digits from real enqueue (including .000000000): %v", postDelete[i].entity, postDelete[i].occurred, err)
+				}
+			}
+
+			// Place fresh mutations strictly after the original delete, independent of
+			// the real clock. The zero-fraction case starts exactly on a second.
+			var originalDeletedAt string
+			if err := s.db.QueryRow(`SELECT deleted_at FROM sync_delete_tombstones WHERE entity = 'project' AND entity_key = 'hotel'`).Scan(&originalDeletedAt); err != nil {
+				t.Fatal(err)
+			}
+			originalDelete, err := time.Parse("2006-01-02 15:04:05.999999999", originalDeletedAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh := originalDelete.Truncate(time.Second).Add(time.Second).Add(tc.fraction)
+			if !fresh.After(originalDelete) {
+				t.Fatal("fixture: fresh mutation must follow original delete")
+			}
+			for i := range postDelete {
+				postDelete[i].occurred = fresh.Format("2006-01-02 15:04:05.000000000")
+				if _, err := s.db.Exec(`UPDATE sync_mutations SET occurred_at = ? WHERE entity = ? AND entity_key = ?`, postDelete[i].occurred, postDelete[i].entity, postDelete[i].entityKey); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Dispositions must hold after the repair: the delete supersedes the
+			// pre-delete mutation, and the recreated project's fresh upserts stay
+			// pending so they can still reach the cloud.
+			assertDispositions := func() {
+				var disposition string
+				if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity = 'session' AND entity_key = 's-tomb-pre-1'`).Scan(&disposition); err != nil {
+					t.Fatalf("read pre-delete session disposition: %v", err)
+				}
+				if disposition != SyncMutationDispositionSuperseded {
+					t.Fatalf("pre-delete session disposition = %q, want %q", disposition, SyncMutationDispositionSuperseded)
+				}
+				for _, key := range postDelete {
+					if err := s.db.QueryRow(`SELECT disposition FROM sync_mutations WHERE entity = ? AND entity_key = ?`, key.entity, key.entityKey).Scan(&disposition); err != nil {
+						t.Fatalf("read post-delete %s disposition: %v", key.entity, err)
+					}
+					if disposition != SyncMutationDispositionPending {
+						t.Fatalf("post-delete %s disposition = %q, want %q (recreated project content must still sync)", key.entity, disposition, SyncMutationDispositionPending)
+					}
+				}
+			}
+			assertNoPostDeleteAction := func(report SyncMutationSupersedeReport, pass string) {
+				for _, action := range report.Actions {
+					for _, key := range postDelete {
+						if action.EntityKey == key.entityKey {
+							t.Fatalf("post-delete mutation %q was superseded in the %s pass (%+v); it must stay pending", action.EntityKey, pass, action)
+						}
+					}
+				}
+			}
+
+			// First pass: controlled post-delete timestamps.
+			report, err := s.SupersedeUnenrolledLegacyMutations(DefaultSyncTargetKey, "hotel", true)
+			if err != nil {
+				t.Fatalf("SupersedeUnenrolledLegacyMutations: %v", err)
+			}
+			assertNoPostDeleteAction(report, "controlled post-delete")
+			assertDispositions()
+
+			// Second pass: put the fence one nanosecond before the earliest fresh
+			// instant. At zero fraction this must be in the preceding second, not
+			// equal to fresh: the production fence deliberately uses <=.
+			earliest := fresh
+			for _, key := range postDelete {
+				instant, err := time.Parse("2006-01-02 15:04:05.999999999", key.occurred)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if instant.Before(earliest) {
+					earliest = instant
+				}
+			}
+			boundary := earliest.Add(-time.Nanosecond).Format("2006-01-02 15:04:05.000000000")
+			if _, err := s.db.Exec(`UPDATE sync_delete_tombstones SET deleted_at = ? WHERE entity = 'project' AND entity_key = 'hotel'`, boundary); err != nil {
+				t.Fatalf("fold project tombstone deleted_at into the mutation second: %v", err)
+			}
+			var deletedAt string
+			if err := s.db.QueryRow(`SELECT deleted_at FROM sync_delete_tombstones WHERE entity = 'project' AND entity_key = 'hotel'`).Scan(&deletedAt); err != nil {
+				t.Fatalf("read folded project tombstone deleted_at: %v", err)
+			}
+			fence, err := time.Parse("2006-01-02 15:04:05.999999999", deletedAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !fence.Equal(earliest.Add(-time.Nanosecond)) {
+				t.Fatalf("project tombstone instant = %v, want %v", fence, earliest.Add(-time.Nanosecond))
+			}
+			for _, key := range postDelete {
+				instant, err := time.Parse("2006-01-02 15:04:05.999999999", key.occurred)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !instant.After(fence) {
+					t.Fatalf("post-delete %s instant %v must be strictly after fence %v", key.entity, instant, fence)
+				}
+				if shares := instant.Truncate(time.Second).Equal(fence.Truncate(time.Second)); shares != tc.sharesSecond {
+					t.Fatalf("fixture: shares second = %v, want %v", shares, tc.sharesSecond)
+				}
+			}
+
+			report, err = s.SupersedeUnenrolledLegacyMutations(DefaultSyncTargetKey, "hotel", true)
+			if err != nil {
+				t.Fatalf("SupersedeUnenrolledLegacyMutations after folding: %v", err)
+			}
+			assertNoPostDeleteAction(report, tc.name)
+			assertDispositions()
+		})
 	}
 }
