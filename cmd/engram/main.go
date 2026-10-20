@@ -804,6 +804,13 @@ func main() {
 		return
 	}
 
+	if usesLocalSQLite(os.Args[1:]) {
+		if err := prepareSQLiteTemp(cfg.DataDir); err != nil {
+			fatal(err)
+			return
+		}
+	}
+
 	// Migrate orphaned databases that ended up in wrong locations
 	// (e.g. drive root on Windows due to previous bug).
 	owned, _ := validateSessionOwned(os.Args[2:])
