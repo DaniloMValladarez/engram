@@ -49,10 +49,79 @@ A short explanation in the issue is sufficient; no separate design document is r
 
 Once the issue is approved:
 
-1. Fork the repo and create a branch from `main`
+1. Fork the repo and create a branch from the canonical `main`
 2. Implement your change
 3. Open a PR using the PR template — **link the approved issue** with `Closes #N`
 4. Add exactly **one `type:*` label** to the PR (see label system below)
+
+#### Forks and remotes
+
+A pull request targets the canonical repository. A fork is where the branch lives, not where the pull request opens.
+
+| Remote | Points at | Holds |
+|---------|-----------|-------|
+| `origin` | your fork | your branches |
+| `upstream` | the canonical repository | the canonical `main` |
+
+Verify both remotes before publishing, then branch from the canonical `main`:
+
+```bash
+# If your clone has no upstream remote yet, add the canonical repository:
+git remote add upstream <canonical-repository-url>
+# Ensure origin points at your fork:
+git remote set-url origin <your-fork-url>
+git remote -v                                   # origin must be your fork, upstream the canonical repository
+git fetch upstream
+git checkout -b feat/1821-short-description upstream/main
+git push -u origin feat/1821-short-description
+```
+
+A plain `git clone` of your fork gives that clone only `origin`; forking on the GitHub web interface changes nothing in a local clone. `gh repo fork --clone` sets both up — the fork becomes `origin` and the previous `origin` is renamed to `upstream` — and `gh repo fork --remote` does the same in an existing clone. If `upstream` is absent, add it before running `git fetch upstream`; the failure is `fatal: 'upstream' does not appear to be a git repository`.
+
+After `git fetch upstream`, branching from `upstream/main` uses the current canonical `main`; this workflow does not require synchronizing your fork's `main`. Branching from a stale local or fork `main` instead may omit recent canonical changes, but does not necessarily produce an unclean diff.
+
+Open the pull request against the canonical repository explicitly, so the destination is never inferred from the clone you happen to be in:
+
+```bash
+gh pr create --repo <canonical-owner>/<canonical-repo> \
+  --head <your-fork-owner>:<branch> --base main \
+  --title "feat(scope): description" --body-file pull_request_body.md
+```
+
+The `--head <owner>:<branch>` form supports user-owned forks only; GitHub CLI does not support an organization as `<owner>`. For an organization-owned fork, use GitHub's web pull-request flow and explicitly select the canonical base repository and branch, the fork, and the head branch before submitting.
+
+#### Authorizations are separate
+
+| Action | Who performs it |
+|--------|-----------------|
+| Create or use a fork | you, once authorized to create or use that fork |
+| Push commits to a branch in your fork | you, once separately authorized to push those commits there |
+| Open or update a pull request in the canonical repository | you, once you are authorized to publish there |
+| Apply the `type:*` label to a pull request in the canonical repository | a maintainer with triage access. A contributor without it receives `does not have the correct permissions to execute AddLabelsToLabelable`; that is a maintainer step, not something to retry |
+| Merge a pull request | a maintainer |
+
+Request the specific action you need. Authorization to create or use a fork does not authorize pushing commits to it. Being authorized to open a pull request is not authorization to label it or to merge it.
+
+#### When a push to the canonical repository is rejected
+
+Do not push branches to the canonical repository. It fails in one of two ways, depending on your access:
+
+- **Without push access** — the remote refuses the push: `ERROR: Permission to <canonical-owner>/<canonical-repo>.git denied to <you>`.
+- **With push access** — the repository's ruleset rejects the new branch: the push fails with `GH013` and the required checks are reported as expected.
+
+Both are the controls working as designed.
+
+- Do not retry the push, silently switch the destination, use an exempt branch namespace, fabricate checks, or change the ruleset.
+- Push the branch to your fork and open the pull request from there, as described above.
+- If neither the fork nor the label step is authorized for your account, stop and ask a maintainer for an authorized route. Record the rejection on the issue: it is useful evidence, not an obstacle to work around.
+
+#### Dependent pull requests
+
+A dependent pull request is a second pull request whose base branch is another contributor's branch. **This repository has no validated procedure for delivering one from a fork, so treat it as requiring maintainer guidance rather than something to work around.**
+
+For a pull request targeting the canonical repository, the base branch must exist in the canonical repository. A fork-only branch can supply the head, not the base. Targeting a fork instead is a distinct, unvalidated workflow requiring maintainer guidance. The diff is computed against the selected base, but that alone does not require the parent pull request to merge first. Who may create the canonical base branch and how to sequence merges are maintainer workflow decisions that this guide does not make for you.
+
+Ask before you start one. For a pull request targeting the canonical repository, do not use a base branch that does not exist in that repository. Pushing a branch to your fork does not make it a valid base for that pull request.
 
 ### Step 4: Automated PR Checks
 
